@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Add typespecs for all public functions
+- Add `scope`, `key`, and `via_name` types
+- Fix `dispatch/3` to skip callback when no members (matches `Registry.dispatch/3`)
+- Fix LICENSE doc warning
+
 ## 0.2.0
 
 - Add `get_members/2` to retrieve all processes in a group
