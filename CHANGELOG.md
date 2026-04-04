@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- Add `get_members/2` to retrieve all processes in a group
+- Add `which_groups/1` to list all registered keys in a scope
+- Add `dispatch/3` to invoke a callback on all members of a group
+- **Breaking:** `register_name/2` now always joins the group (no uniqueness guard)
+
 ## 0.1.0
 
 - Initial release
