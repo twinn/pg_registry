@@ -47,14 +47,8 @@ defmodule PgRegistry do
   for unique registrations.
   """
   def register_name({scope, key}, pid) do
-    case :pg.get_members(scope, key) do
-      [] ->
-        :pg.join(scope, key, pid)
-        :yes
-
-      _members ->
-        :no
-    end
+    :pg.join(scope, key, pid)
+    :yes
   end
 
   @doc """
@@ -80,6 +74,24 @@ defmodule PgRegistry do
       [pid | _] -> pid
       [] -> :undefined
     end
+  end
+
+  @doc """
+  Returns all processes registered under `key` in the given `scope`.
+  """
+  defdelegate get_members(scope, key), to: :pg
+
+  @doc """
+  Returns all groups in the given `scope`.
+  """
+  defdelegate which_groups(scope), to: :pg
+
+  @doc """
+  Invokes `callback` with the list of members registered under `key` in `scope`.
+  """
+  def dispatch(scope, key, callback) when is_function(callback, 1) do
+    callback.(:pg.get_members(scope, key))
+    :ok
   end
 
   @doc """

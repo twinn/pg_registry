@@ -18,9 +18,19 @@ defmodule PgRegistryTest do
       assert :yes = PgRegistry.register_name({scope, :my_key}, self())
     end
 
-    test "returns :no for duplicate registration", %{scope: scope} do
+    test "allows multiple processes to register under the same key", %{scope: scope} do
+      task =
+        Task.async(fn ->
+          PgRegistry.register_name({scope, :my_key}, self())
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(50)
+
       assert :yes = PgRegistry.register_name({scope, :my_key}, self())
-      assert :no = PgRegistry.register_name({scope, :my_key}, self())
+      assert length(PgRegistry.get_members(scope, :my_key)) == 2
+
+      Task.shutdown(task, :brutal_kill)
     end
   end
 
@@ -54,6 +64,85 @@ defmodule PgRegistryTest do
       assert_raise ArgumentError, fn ->
         PgRegistry.send({scope, :no_such_key}, :hello)
       end
+    end
+  end
+
+  describe "get_members/2" do
+    test "returns all processes registered under a key", %{scope: scope} do
+      task1 =
+        Task.async(fn ->
+          PgRegistry.register_name({scope, :group}, self())
+          Process.sleep(:infinity)
+        end)
+
+      task2 =
+        Task.async(fn ->
+          PgRegistry.register_name({scope, :group}, self())
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(50)
+
+      members = PgRegistry.get_members(scope, :group)
+      assert length(members) == 2
+      assert task1.pid in members
+      assert task2.pid in members
+
+      Task.shutdown(task1, :brutal_kill)
+      Task.shutdown(task2, :brutal_kill)
+    end
+
+    test "returns empty list for unknown key", %{scope: scope} do
+      assert [] == PgRegistry.get_members(scope, :no_such_key)
+    end
+  end
+
+  describe "which_groups/1" do
+    test "returns all registered keys", %{scope: scope} do
+      PgRegistry.register_name({scope, :group_a}, self())
+      PgRegistry.register_name({scope, :group_b}, self())
+
+      groups = PgRegistry.which_groups(scope)
+      assert :group_a in groups
+      assert :group_b in groups
+    end
+
+    test "returns empty list when no groups exist", %{scope: scope} do
+      assert [] == PgRegistry.which_groups(scope)
+    end
+  end
+
+  describe "dispatch/3" do
+    test "invokes callback for each member", %{scope: scope} do
+      parent = self()
+
+      for i <- 1..3 do
+        Task.async(fn ->
+          PgRegistry.register_name({scope, :workers}, self())
+          send(parent, {:ready, i})
+          Process.sleep(:infinity)
+        end)
+      end
+
+      for _ <- 1..3, do: assert_receive({:ready, _})
+
+      PgRegistry.dispatch(scope, :workers, fn members ->
+        for pid <- members, do: send(pid, :work)
+      end)
+
+      # Verify all 3 received the message via get_members
+      members = PgRegistry.get_members(scope, :workers)
+      assert length(members) == 3
+    end
+
+    test "invokes callback with empty list when no members", %{scope: scope} do
+      parent = self()
+
+      PgRegistry.dispatch(scope, :nobody, fn members ->
+        send(parent, {:members, members})
+      end)
+
+      assert_receive {:members, []}
     end
   end
 
