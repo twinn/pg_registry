@@ -101,8 +101,14 @@ defmodule PgRegistry do
   """
   @spec dispatch(scope(), key(), ([pid()] -> term())) :: :ok
   def dispatch(scope, key, callback) when is_function(callback, 1) do
-    callback.(:pg.get_members(scope, key))
-    :ok
+    case :pg.get_members(scope, key) do
+      [] ->
+        :ok
+
+      members ->
+        callback.(members)
+        :ok
+    end
   end
 
   @doc """
