@@ -135,14 +135,10 @@ defmodule PgRegistryTest do
       assert length(members) == 3
     end
 
-    test "invokes callback with empty list when no members", %{scope: scope} do
-      parent = self()
-
-      PgRegistry.dispatch(scope, :nobody, fn members ->
-        send(parent, {:members, members})
+    test "does not invoke callback when no members", %{scope: scope} do
+      PgRegistry.dispatch(scope, :nobody, fn _members ->
+        flunk("callback should not be invoked")
       end)
-
-      assert_receive {:members, []}
     end
   end
 
