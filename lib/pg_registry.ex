@@ -15,12 +15,17 @@ defmodule PgRegistry do
       GenServer.start_link(MyServer, arg, name: {:via, PgRegistry, {:my_registry, :my_key}})
   """
 
+  @type scope :: atom()
+  @type key :: term()
+  @type via_name :: {scope(), key()}
+
   @doc """
   Starts a `PgRegistry` scope.
 
   The `scope` is an atom used to namespace registrations. It is passed
   directly to `:pg.start_link/1`.
   """
+  @spec start_link(scope()) :: {:ok, pid()} | {:error, term()}
   def start_link(scope) when is_atom(scope) do
     :pg.start_link(scope)
   end
@@ -32,6 +37,7 @@ defmodule PgRegistry do
         {PgRegistry, :my_registry}
       ]
   """
+  @spec child_spec(scope()) :: Supervisor.child_spec()
   def child_spec(scope) do
     %{
       id: {__MODULE__, scope},
@@ -42,10 +48,10 @@ defmodule PgRegistry do
   @doc """
   Registers the given `pid` under `{scope, key}`.
 
-  Returns `:yes` on success or `:no` if another process is already
-  registered under the same key. This implements the `:via` callback
-  for unique registrations.
+  Always returns `:yes`. Multiple processes can register under the
+  same key. Implements the `:via` callback.
   """
+  @spec register_name(via_name(), pid()) :: :yes
   def register_name({scope, key}, pid) do
     :pg.join(scope, key, pid)
     :yes
@@ -56,6 +62,7 @@ defmodule PgRegistry do
 
   Always returns `:ok`.
   """
+  @spec unregister_name(via_name()) :: :ok
   def unregister_name({scope, key}) do
     for pid <- :pg.get_members(scope, key) do
       :pg.leave(scope, key, pid)
@@ -69,6 +76,7 @@ defmodule PgRegistry do
 
   Returns the pid if found, or `:undefined` otherwise.
   """
+  @spec whereis_name(via_name()) :: pid() | :undefined
   def whereis_name({scope, key}) do
     case :pg.get_members(scope, key) do
       [pid | _] -> pid
@@ -79,16 +87,19 @@ defmodule PgRegistry do
   @doc """
   Returns all processes registered under `key` in the given `scope`.
   """
+  @spec get_members(scope(), key()) :: [pid()]
   defdelegate get_members(scope, key), to: :pg
 
   @doc """
   Returns all groups in the given `scope`.
   """
+  @spec which_groups(scope()) :: [key()]
   defdelegate which_groups(scope), to: :pg
 
   @doc """
   Invokes `callback` with the list of members registered under `key` in `scope`.
   """
+  @spec dispatch(scope(), key(), ([pid()] -> term())) :: :ok
   def dispatch(scope, key, callback) when is_function(callback, 1) do
     callback.(:pg.get_members(scope, key))
     :ok
@@ -99,6 +110,7 @@ defmodule PgRegistry do
 
   Returns the pid. Raises `ArgumentError` if no process is registered.
   """
+  @spec send(via_name(), term()) :: pid()
   def send({scope, key} = name, msg) do
     case whereis_name(name) do
       :undefined ->
