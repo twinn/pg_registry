@@ -64,7 +64,7 @@ defmodule PgRegistry do
   """
   @spec unregister_name(via_name()) :: :ok
   def unregister_name({scope, key}) do
-    for pid <- :pg.get_members(scope, key) do
+    for pid <- :pg.get_local_members(scope, key) do
       :pg.leave(scope, key, pid)
     end
 
@@ -78,9 +78,15 @@ defmodule PgRegistry do
   """
   @spec whereis_name(via_name()) :: pid() | :undefined
   def whereis_name({scope, key}) do
-    case :pg.get_members(scope, key) do
-      [pid | _] -> pid
-      [] -> :undefined
+    case :pg.get_local_members(scope, key) do
+      [pid | _] ->
+        pid
+
+      [] ->
+        case :pg.get_members(scope, key) do
+          [pid | _] -> pid
+          [] -> :undefined
+        end
     end
   end
 

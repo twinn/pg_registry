@@ -43,6 +43,23 @@ defmodule PgRegistryTest do
     test "returns :undefined for unregistered key", %{scope: scope} do
       assert :undefined == PgRegistry.whereis_name({scope, :no_such_key})
     end
+
+    test "prefers local members", %{scope: scope} do
+      PgRegistry.register_name({scope, :my_key}, self())
+
+      assert self() == PgRegistry.whereis_name({scope, :my_key})
+      assert [self()] == :pg.get_local_members(scope, :my_key)
+    end
+
+    test "falls back to remote members when no local members exist", %{scope: scope} do
+      PgRegistry.register_name({scope, :my_key}, self())
+      assert self() == PgRegistry.whereis_name({scope, :my_key})
+
+      # On a single node, get_members returns the same as get_local_members,
+      # so this just verifies the fallback path doesn't break
+      PgRegistry.unregister_name({scope, :my_key})
+      assert :undefined == PgRegistry.whereis_name({scope, :my_key})
+    end
   end
 
   describe "unregister_name/1" do
@@ -50,6 +67,15 @@ defmodule PgRegistryTest do
       PgRegistry.register_name({scope, :my_key}, self())
       assert :ok = PgRegistry.unregister_name({scope, :my_key})
       assert :undefined == PgRegistry.whereis_name({scope, :my_key})
+    end
+
+    test "only unregisters local members", %{scope: scope} do
+      PgRegistry.register_name({scope, :my_key}, self())
+      assert [self()] == :pg.get_local_members(scope, :my_key)
+
+      PgRegistry.unregister_name({scope, :my_key})
+
+      assert [] == :pg.get_local_members(scope, :my_key)
     end
   end
 
