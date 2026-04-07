@@ -135,29 +135,151 @@ defmodule PgRegistry.PgTest do
     end
   end
 
+  describe "join/4 with metadata" do
+    test "single pid with metadata", %{scope: scope} do
+      assert :ok = Pg.join(scope, :g, self(), %{role: :primary})
+      assert [{self(), %{role: :primary}}] == Pg.lookup(scope, :g)
+      assert [{self(), %{role: :primary}}] == Pg.lookup_local(scope, :g)
+      # bare-pid API still works
+      assert [self()] == Pg.get_members(scope, :g)
+    end
+
+    test "join/3 stores nil metadata", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self())
+      assert [{self(), nil}] == Pg.lookup(scope, :g)
+    end
+
+    test "list of pids share the same metadata", %{scope: scope} do
+      p1 = spawn_member(scope, :other)
+      :ok = Pg.join(scope, :g, [self(), p1], :shared)
+      entries = Pg.lookup(scope, :g)
+      assert {self(), :shared} in entries
+      assert {p1, :shared} in entries
+      stop(p1)
+    end
+
+    test "successive joins with different metas keep both entries", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :first)
+      :ok = Pg.join(scope, :g, self(), :second)
+      entries = Pg.lookup(scope, :g)
+      assert length(entries) == 2
+      assert {self(), :first} in entries
+      assert {self(), :second} in entries
+      # bare-pid API sees the duplicate as expected
+      assert [self(), self()] == Pg.get_members(scope, :g)
+    end
+
+    test "leave/3 removes the most recently joined entry first", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :first)
+      :ok = Pg.join(scope, :g, self(), :second)
+      :ok = Pg.leave(scope, :g, self())
+      # joins prepend, so :second was at the head — it should be gone first
+      assert [{self(), :first}] == Pg.lookup(scope, :g)
+    end
+  end
+
+  describe "update_meta/4" do
+    test "updates the meta of a joined pid", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :old)
+      assert :ok = Pg.update_meta(scope, :g, self(), :new)
+      assert [{self(), :new}] == Pg.lookup(scope, :g)
+    end
+
+    test "returns :not_joined when the pid is not in the group", %{scope: scope} do
+      assert :not_joined = Pg.update_meta(scope, :g, self(), :whatever)
+    end
+
+    test "updates all entries when the pid is joined multiple times", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :first)
+      :ok = Pg.join(scope, :g, self(), :second)
+      :ok = Pg.update_meta(scope, :g, self(), :unified)
+      assert [{self(), :unified}, {self(), :unified}] == Pg.lookup(scope, :g)
+    end
+
+    test "delivers :update notification with old and new meta", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :old)
+      {ref, _} = Pg.monitor_scope(scope)
+      :ok = Pg.update_meta(scope, :g, self(), :new)
+      me = self()
+      assert_receive {^ref, :update, :g, [{^me, :old, :new}]}
+    end
+
+    test ":update notification covers all matching entries", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :a)
+      :ok = Pg.join(scope, :g, self(), :b)
+      {ref, _} = Pg.monitor_scope(scope)
+      :ok = Pg.update_meta(scope, :g, self(), :z)
+      me = self()
+      assert_receive {^ref, :update, :g, updates}
+      assert length(updates) == 2
+      assert {me, :a, :z} in updates
+      assert {me, :b, :z} in updates
+    end
+
+    test "rejects updates for non-local pids" do
+      # we don't have a remote pid handy in this single-node test, just exercise
+      # the guard with a malformed argument
+      assert_raise FunctionClauseError, fn ->
+        Pg.update_meta(:any_scope, :g, :not_a_pid, :meta)
+      end
+    end
+
+    test "demonitor flushes :update messages too", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :old)
+      {ref, _} = Pg.monitor_scope(scope)
+      :ok = Pg.update_meta(scope, :g, self(), :new)
+      assert :ok = Pg.demonitor(scope, ref)
+      refute_receive {^ref, _, _, _}, 50
+    end
+  end
+
+  describe "lookup/2 and lookup_local/2" do
+    test "return [] for unknown group", %{scope: scope} do
+      assert [] == Pg.lookup(scope, :nope)
+      assert [] == Pg.lookup_local(scope, :nope)
+    end
+
+    test "lookup_local is a subset of lookup", %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), %{n: 1})
+      assert Pg.lookup_local(scope, :g) == Pg.lookup(scope, :g)
+    end
+  end
+
   describe "monitor_scope/1" do
     test "returns current scope contents and a ref", %{scope: scope} do
-      :ok = Pg.join(scope, :g, self())
+      :ok = Pg.join(scope, :g, self(), :m)
       {ref, contents} = Pg.monitor_scope(scope)
       assert is_reference(ref)
-      assert %{g: [pid]} = contents
-      assert pid == self()
+      assert %{g: [{self(), :m}]} == Map.take(contents, [:g])
     end
 
     test "delivers join and leave notifications", %{scope: scope} do
       {ref, _} = Pg.monitor_scope(scope)
-      :ok = Pg.join(scope, :g, self())
-      assert_receive {^ref, :join, :g, [pid]} when pid == self()
+      :ok = Pg.join(scope, :g, self(), :m)
+      me = self()
+      assert_receive {^ref, :join, :g, [{^me, :m}]}
       :ok = Pg.leave(scope, :g, self())
-      assert_receive {^ref, :leave, :g, [pid]} when pid == self()
+      assert_receive {^ref, :leave, :g, [{^me, :m}]}
+    end
+
+    test "leave notification carries the meta from the entry that was removed",
+         %{scope: scope} do
+      :ok = Pg.join(scope, :g, self(), :first)
+      :ok = Pg.join(scope, :g, self(), :second)
+      {ref, _} = Pg.monitor_scope(scope)
+      :ok = Pg.leave(scope, :g, self())
+      me = self()
+      # joins prepend, so :second (head) is removed first
+      assert_receive {^ref, :leave, :g, [{^me, :second}]}
     end
   end
 
   describe "monitor/2 (single group)" do
     test "returns members and only delivers notifications for that group", %{scope: scope} do
       {ref, []} = Pg.monitor(scope, :g)
-      :ok = Pg.join(scope, :g, self())
-      assert_receive {^ref, :join, :g, [pid]} when pid == self()
+      :ok = Pg.join(scope, :g, self(), :hello)
+      me = self()
+      assert_receive {^ref, :join, :g, [{^me, :hello}]}
 
       :ok = Pg.join(scope, :other, self())
       refute_receive {^ref, :join, :other, _}, 50

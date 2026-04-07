@@ -1,26 +1,33 @@
 defmodule PgRegistry.Pg do
   @moduledoc """
-  An Elixir port of Erlang's `:pg` module.
+  An Elixir port of Erlang's `:pg` module, extended internally to carry
+  per-member metadata.
 
   Distributed named process groups with eventually consistent membership.
-  This is a near line-for-line translation of the OTP 27 `pg.erl` (single
-  GenServer + ETS table) into Elixir, kept self-contained so we can extend
-  it with metadata support without forking OTP.
 
   Each scope is its own GenServer registered locally under the scope name,
   and owns an ETS table of the same name with rows of shape:
 
-      {group, all_pids, local_pids}
+      {group, all_entries, local_entries}
 
-  Lookups (`get_members/2`, `get_local_members/2`, `which_groups/1`) read
-  the ETS table directly from the caller, so they are O(1) and never block.
-  All mutations go through the GenServer.
+  where each entry is `{pid, meta}` and `meta` defaults to `nil`. The
+  third slot is the subset of entries whose pid lives on this node.
+
+  As of step 1, the public API is unchanged: `get_members/2` and
+  `get_local_members/2` still return `[pid]`, and subscription
+  notifications still carry `[pid]`. Metadata is stored and gossiped
+  between nodes but not yet exposed.
+
+  Lookups read the ETS table directly from the caller, so they are O(1)
+  and never block. All mutations go through the GenServer.
   """
 
   use GenServer
 
   @type scope :: atom()
   @type group :: term()
+  @type meta :: term()
+  @type entry :: {pid(), meta()}
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -46,8 +53,22 @@ defmodule PgRegistry.Pg do
 
   @spec join(scope(), group(), pid() | [pid()]) :: :ok
   def join(scope, group, pid_or_pids) when is_pid(pid_or_pids) or is_list(pid_or_pids) do
+    join(scope, group, pid_or_pids, nil)
+  end
+
+  @doc """
+  Joins one or more local processes to `group` with `meta` attached.
+
+  When a list of pids is given, the same `meta` is stored for each. To
+  store different metadata for different pids, call `join/4` multiple
+  times. A pid may be joined to the same group multiple times with
+  different metas; each entry is independent and must be left
+  separately.
+  """
+  @spec join(scope(), group(), pid() | [pid()], meta()) :: :ok
+  def join(scope, group, pid_or_pids, meta) when is_pid(pid_or_pids) or is_list(pid_or_pids) do
     :ok = ensure_local(pid_or_pids)
-    GenServer.call(scope, {:join_local, group, pid_or_pids}, :infinity)
+    GenServer.call(scope, {:join_local, group, pid_or_pids, meta}, :infinity)
   end
 
   @spec leave(scope(), group(), pid() | [pid()]) :: :ok | :not_joined
@@ -56,22 +77,30 @@ defmodule PgRegistry.Pg do
     GenServer.call(scope, {:leave_local, group, pid_or_pids}, :infinity)
   end
 
+  @doc """
+  Replaces the metadata of every entry in `group` whose pid is `pid`,
+  setting it to `new_meta`.
+
+  If `pid` was joined multiple times to `group` (with possibly different
+  metas), all of those entries are updated to `new_meta`. Returns
+  `:not_joined` when `pid` is not in the group.
+
+  Subscribers receive `{ref, :update, group, [{pid, old_meta, new_meta}, ...]}`.
+  """
+  @spec update_meta(scope(), group(), pid(), meta()) :: :ok | :not_joined
+  def update_meta(scope, group, pid, new_meta) when is_pid(pid) do
+    :ok = ensure_local(pid)
+    GenServer.call(scope, {:update_meta, group, pid, new_meta}, :infinity)
+  end
+
   @spec get_members(scope(), group()) :: [pid()]
   def get_members(scope, group) do
-    try do
-      :ets.lookup_element(scope, group, 2, [])
-    rescue
-      ArgumentError -> []
-    end
+    extract_pids(lookup(scope, group))
   end
 
   @spec get_local_members(scope(), group()) :: [pid()]
   def get_local_members(scope, group) do
-    try do
-      :ets.lookup_element(scope, group, 3, [])
-    rescue
-      ArgumentError -> []
-    end
+    extract_pids(lookup_local(scope, group))
   end
 
   @spec which_groups(scope()) :: [group()]
@@ -79,10 +108,23 @@ defmodule PgRegistry.Pg do
     for [g] <- :ets.match(scope, {:"$1", :_, :_}), do: g
   end
 
-  @spec monitor_scope(scope()) :: {reference(), %{group() => [pid()]}}
+  @doc """
+  Subscribes to all group changes in `scope`.
+
+  Returns `{ref, snapshot}` where `snapshot` is `%{group => [{pid, meta}]}`.
+  Subsequent join/leave events are delivered as
+  `{ref, :join | :leave, group, [{pid, meta}, ...]}`.
+  """
+  @spec monitor_scope(scope()) :: {reference(), %{group() => [entry()]}}
   def monitor_scope(scope), do: GenServer.call(scope, :monitor, :infinity)
 
-  @spec monitor(scope(), group()) :: {reference(), [pid()]}
+  @doc """
+  Subscribes to changes in a single `group`.
+
+  Returns `{ref, [{pid, meta}, ...]}` and delivers entry-shaped
+  notifications, same as `monitor_scope/1`.
+  """
+  @spec monitor(scope(), group()) :: {reference(), [entry()]}
   def monitor(scope, group), do: GenServer.call(scope, {:monitor, group}, :infinity)
 
   @spec demonitor(scope(), reference()) :: :ok | false
@@ -97,6 +139,31 @@ defmodule PgRegistry.Pg do
     end
   end
 
+  @doc """
+  Returns all `{pid, meta}` entries registered under `group`, across the
+  whole cluster.
+
+  This is the metadata-aware counterpart to `get_members/2`. The same
+  pid may appear multiple times if it was joined more than once.
+  """
+  @spec lookup(scope(), group()) :: [entry()]
+  def lookup(scope, group) do
+    :ets.lookup_element(scope, group, 2, [])
+  rescue
+    ArgumentError -> []
+  end
+
+  @doc """
+  Returns the `{pid, meta}` entries for `group` whose pid lives on the
+  local node.
+  """
+  @spec lookup_local(scope(), group()) :: [entry()]
+  def lookup_local(scope, group) do
+    :ets.lookup_element(scope, group, 3, [])
+  rescue
+    ArgumentError -> []
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer
   # ---------------------------------------------------------------------------
@@ -104,9 +171,10 @@ defmodule PgRegistry.Pg do
   defmodule State do
     @moduledoc false
     defstruct scope: nil,
-              # %{pid => {monitor_ref, [group]}} — locally joined processes
+              # %{pid => {monitor_ref, [group]}} — locally joined processes.
+              # Used for monitor bookkeeping; metadata lives in ETS, not here.
               local: %{},
-              # %{peer_pid => {monitor_ref, %{group => [pid]}}} — remote scope peers
+              # %{peer_pid => {monitor_ref, %{group => [{pid, meta}]}}}
               remote: %{},
               # %{ref => subscriber_pid} — whole-scope subscribers
               scope_monitors: %{},
@@ -129,11 +197,32 @@ defmodule PgRegistry.Pg do
   end
 
   @impl true
-  def handle_call({:join_local, group, pid_or_pids}, _from, %State{} = s) do
+  def handle_call({:join_local, group, pid_or_pids, meta}, _from, %State{} = s) do
+    entries = wrap_meta(pid_or_pids, meta)
     new_local = join_local(pid_or_pids, group, s.local)
-    join_local_update_ets(s.scope, s.scope_monitors, s.monitored_groups, group, pid_or_pids)
-    broadcast(Map.keys(s.remote), {:join, self(), group, pid_or_pids})
+    join_local_update_ets(s.scope, s.scope_monitors, s.monitored_groups, group, entries)
+    broadcast(Map.keys(s.remote), {:join, self(), group, entries})
     {:reply, :ok, %{s | local: new_local}}
+  end
+
+  def handle_call({:update_meta, group, pid, new_meta}, _from, %State{} = s) do
+    case :ets.lookup(s.scope, group) do
+      [{_g, all, local}] ->
+        case replace_meta_for_pid(all, pid, new_meta) do
+          {_, []} ->
+            {:reply, :not_joined, s}
+
+          {new_all, updates} ->
+            {new_local, _} = replace_meta_for_pid(local, pid, new_meta)
+            :ets.insert(s.scope, {group, new_all, new_local})
+            notify_group(s.scope_monitors, s.monitored_groups, :update, group, updates)
+            broadcast(Map.keys(s.remote), {:update_meta, self(), group, pid, new_meta})
+            {:reply, :ok, s}
+        end
+
+      [] ->
+        {:reply, :not_joined, s}
+    end
   end
 
   def handle_call({:leave_local, group, pid_or_pids}, _from, %State{} = s) do
@@ -149,13 +238,17 @@ defmodule PgRegistry.Pg do
   end
 
   def handle_call(:monitor, {pid, _tag}, %State{} = s) do
-    contents = for [g, p] <- :ets.match(s.scope, {:"$1", :"$2", :_}), into: %{}, do: {g, p}
+    contents =
+      for [g, entries] <- :ets.match(s.scope, {:"$1", :"$2", :_}),
+          into: %{},
+          do: {g, entries}
+
     ref = Process.monitor(pid, tag: {:DOWN, :scope_monitors})
     {:reply, {ref, contents}, %{s | scope_monitors: Map.put(s.scope_monitors, ref, pid)}}
   end
 
   def handle_call({:monitor, group}, {pid, _tag}, %State{} = s) do
-    members = get_members(s.scope, group)
+    members = lookup(s.scope, group)
     ref = Process.monitor(pid, tag: {:DOWN, :group_monitors})
 
     new_mg =
@@ -190,11 +283,11 @@ defmodule PgRegistry.Pg do
   end
 
   @impl true
-  def handle_info({:join, peer, group, pid_or_pids}, %State{} = s) do
+  def handle_info({:join, peer, group, entries}, %State{} = s) do
     case Map.get(s.remote, peer) do
       {mref, remote_groups} ->
-        join_remote_update_ets(s.scope, s.scope_monitors, s.monitored_groups, group, pid_or_pids)
-        new_remote_groups = join_remote(group, pid_or_pids, remote_groups)
+        join_remote_update_ets(s.scope, s.scope_monitors, s.monitored_groups, group, entries)
+        new_remote_groups = join_remote(group, entries, remote_groups)
         {:noreply, %{s | remote: Map.put(s.remote, peer, {mref, new_remote_groups})}}
 
       nil ->
@@ -222,6 +315,32 @@ defmodule PgRegistry.Pg do
     end
   end
 
+  def handle_info({:update_meta, peer, group, pid, new_meta}, %State{} = s) do
+    with {:ok, {mref, remote_groups}} <- Map.fetch(s.remote, peer),
+         [{_g, all, local}] <- :ets.lookup(s.scope, group) do
+      {new_all, updates} = replace_meta_for_pid(all, pid, new_meta)
+
+      if updates != [] do
+        :ets.insert(s.scope, {group, new_all, local})
+        notify_group(s.scope_monitors, s.monitored_groups, :update, group, updates)
+      end
+
+      new_remote_groups =
+        case Map.get(remote_groups, group) do
+          nil ->
+            remote_groups
+
+          entries ->
+            {updated, _} = replace_meta_for_pid(entries, pid, new_meta)
+            Map.put(remote_groups, group, updated)
+        end
+
+      {:noreply, %{s | remote: Map.put(s.remote, peer, {mref, new_remote_groups})}}
+    else
+      _ -> {:noreply, s}
+    end
+  end
+
   def handle_info({:discover, peer}, %State{} = s), do: handle_discover(peer, s)
   def handle_info({:discover, peer, _proto_version}, %State{} = s), do: handle_discover(peer, s)
 
@@ -245,7 +364,8 @@ defmodule PgRegistry.Pg do
   def handle_info({:DOWN, mref, :process, pid, _info}, %State{} = s) do
     case Map.pop(s.remote, pid) do
       {{^mref, remote_map}, new_remote} ->
-        Enum.each(remote_map, fn {group, pids} ->
+        Enum.each(remote_map, fn {group, entries} ->
+          pids = extract_pids(entries)
           leave_remote_update_ets(s.scope, s.scope_monitors, s.monitored_groups, pids, [group])
         end)
 
@@ -300,21 +420,18 @@ defmodule PgRegistry.Pg do
   end
 
   # ---------------------------------------------------------------------------
-  # Internals (mirrors pg.erl helpers)
+  # Internals
   # ---------------------------------------------------------------------------
 
-  defp handle_discover(peer, %State{remote: remote, local: local, scope: scope} = s) do
-    GenServer.cast(peer, {:sync, self(), all_local_pids(local)})
+  defp handle_discover(peer, %State{remote: remote, scope: scope} = s) do
+    GenServer.cast(peer, {:sync, self(), all_local_entries(scope)})
 
-    case Map.has_key?(remote, peer) do
-      true ->
-        {:noreply, s}
-
-      false ->
-        mref = Process.monitor(peer)
-        send(peer, {:discover, self()})
-        _ = scope
-        {:noreply, %{s | remote: Map.put(remote, peer, {mref, %{}})}}
+    if Map.has_key?(remote, peer) do
+      {:noreply, s}
+    else
+      mref = Process.monitor(peer)
+      send(peer, {:discover, self()})
+      {:noreply, %{s | remote: Map.put(remote, peer, {mref, %{}})}}
     end
   end
 
@@ -331,7 +448,58 @@ defmodule PgRegistry.Pg do
 
   defp ensure_local(bad), do: :erlang.error({:nolocal, bad})
 
-  # --- local membership bookkeeping ---
+  # --- entry helpers ---
+
+  defp wrap_meta(pid, meta) when is_pid(pid), do: [{pid, meta}]
+  defp wrap_meta(pids, meta) when is_list(pids), do: Enum.map(pids, &{&1, meta})
+
+  defp extract_pids(entries), do: for({p, _} <- entries, do: p)
+
+  # Pops the first entry whose pid matches `target`. Mirrors :pg.erl's
+  # `lists:delete/2` for ref-counted joins, but compares only the pid
+  # component (meta is ignored on leave) and returns the popped entry
+  # so callers can ship its meta in notifications.
+  defp pop_first_by_pid([], _target), do: {nil, []}
+  defp pop_first_by_pid([{target, _} = entry | tail], target), do: {entry, tail}
+
+  defp pop_first_by_pid([head | tail], target) do
+    {popped, rest} = pop_first_by_pid(tail, target)
+    {popped, [head | rest]}
+  end
+
+  # Replaces every {pid, _} entry's meta with `new_meta`. Returns the
+  # rewritten entries list AND a list of `{pid, old_meta, new_meta}`
+  # triples for the entries that actually changed (so subscribers can
+  # see what was updated). Entries with `^new_meta` already are still
+  # reported as triples, since the user explicitly asked for the update.
+  defp replace_meta_for_pid(entries, pid, new_meta) do
+    entries
+    |> Enum.map_reduce([], fn
+      {^pid, old_meta} = _entry, updates ->
+        {{pid, new_meta}, [{pid, old_meta, new_meta} | updates]}
+
+      other, updates ->
+        {other, updates}
+    end)
+    |> then(fn {new_entries, updates_rev} -> {new_entries, Enum.reverse(updates_rev)} end)
+  end
+
+  # Pops one entry per pid in `pids`, in input order. Pids without a
+  # match in `entries` are silently skipped (matching pg.erl semantics).
+  # Returns {popped_entries_in_input_order, remaining_entries}.
+  defp pop_first_by_pids(entries, pids) do
+    {popped_rev, remaining} =
+      Enum.reduce(pids, {[], entries}, fn pid, {popped, rem} ->
+        case pop_first_by_pid(rem, pid) do
+          {nil, _} -> {popped, rem}
+          {entry, new_rem} -> {[entry | popped], new_rem}
+        end
+      end)
+
+    {Enum.reverse(popped_rev), remaining}
+  end
+
+  # --- local membership bookkeeping (state.local) ---
 
   defp join_local(pid, group, local) when is_pid(pid) do
     case Map.fetch(local, pid) do
@@ -374,132 +542,86 @@ defmodule PgRegistry.Pg do
     leave_local(tail, group, leave_local(pid, group, local))
   end
 
-  # --- ETS updates ---
+  # --- ETS updates (operate on entries) ---
 
-  defp join_local_update_ets(scope, scope_mon, mg, group, pid) when is_pid(pid) do
+  defp join_local_update_ets(scope, scope_mon, mg, group, entries) when is_list(entries) do
     case :ets.lookup(scope, group) do
       [{_g, all, local}] ->
-        :ets.insert(scope, {group, [pid | all], [pid | local]})
+        :ets.insert(scope, {group, entries ++ all, entries ++ local})
 
       [] ->
-        :ets.insert(scope, {group, [pid], [pid]})
+        :ets.insert(scope, {group, entries, entries})
     end
 
-    notify_group(scope_mon, mg, :join, group, [pid])
+    notify_group(scope_mon, mg, :join, group, entries)
   end
 
-  defp join_local_update_ets(scope, scope_mon, mg, group, pids) when is_list(pids) do
+  defp join_remote_update_ets(scope, scope_mon, mg, group, entries) when is_list(entries) do
     case :ets.lookup(scope, group) do
-      [{_g, all, local}] ->
-        :ets.insert(scope, {group, pids ++ all, pids ++ local})
-
-      [] ->
-        :ets.insert(scope, {group, pids, pids})
+      [{_g, all, local}] -> :ets.insert(scope, {group, entries ++ all, local})
+      [] -> :ets.insert(scope, {group, entries, []})
     end
 
-    notify_group(scope_mon, mg, :join, group, pids)
+    notify_group(scope_mon, mg, :join, group, entries)
   end
 
-  defp join_remote_update_ets(scope, scope_mon, mg, group, pid) when is_pid(pid) do
-    case :ets.lookup(scope, group) do
-      [{_g, all, local}] -> :ets.insert(scope, {group, [pid | all], local})
-      [] -> :ets.insert(scope, {group, [pid], []})
-    end
-
-    notify_group(scope_mon, mg, :join, group, [pid])
-  end
-
-  defp join_remote_update_ets(scope, scope_mon, mg, group, pids) when is_list(pids) do
-    case :ets.lookup(scope, group) do
-      [{_g, all, local}] -> :ets.insert(scope, {group, pids ++ all, local})
-      [] -> :ets.insert(scope, {group, pids, []})
-    end
-
-    notify_group(scope_mon, mg, :join, group, pids)
-  end
-
-  defp leave_local_update_ets(scope, scope_mon, mg, group, pid) when is_pid(pid) do
-    case :ets.lookup(scope, group) do
-      [{_g, [^pid], [^pid]}] ->
-        :ets.delete(scope, group)
-        notify_group(scope_mon, mg, :leave, group, [pid])
-
-      [{_g, all, local}] ->
-        :ets.insert(scope, {group, List.delete(all, pid), List.delete(local, pid)})
-        notify_group(scope_mon, mg, :leave, group, [pid])
-
-      [] ->
-        true
-    end
-  end
+  defp leave_local_update_ets(scope, scope_mon, mg, group, pid) when is_pid(pid),
+    do: leave_local_update_ets(scope, scope_mon, mg, group, [pid])
 
   defp leave_local_update_ets(scope, scope_mon, mg, group, pids) when is_list(pids) do
     case :ets.lookup(scope, group) do
       [{_g, all, local}] ->
-        case all -- pids do
-          [] -> :ets.delete(scope, group)
-          new_all -> :ets.insert(scope, {group, new_all, local -- pids})
+        {popped, new_all} = pop_first_by_pids(all, pids)
+        {_, new_local} = pop_first_by_pids(local, pids)
+
+        if new_all == [] do
+          :ets.delete(scope, group)
+        else
+          :ets.insert(scope, {group, new_all, new_local})
         end
 
-        notify_group(scope_mon, mg, :leave, group, pids)
+        if popped != [], do: notify_group(scope_mon, mg, :leave, group, popped)
 
       [] ->
         true
     end
   end
 
-  defp leave_remote_update_ets(scope, scope_mon, mg, pid, groups) when is_pid(pid) do
-    Enum.each(groups, fn group ->
-      case :ets.lookup(scope, group) do
-        [{_g, [^pid], []}] ->
-          :ets.delete(scope, group)
-          notify_group(scope_mon, mg, :leave, group, [pid])
-
-        [{_g, all, local}] ->
-          :ets.insert(scope, {group, List.delete(all, pid), local})
-          notify_group(scope_mon, mg, :leave, group, [pid])
-
-        [] ->
-          true
-      end
-    end)
-  end
+  defp leave_remote_update_ets(scope, scope_mon, mg, pid, groups) when is_pid(pid),
+    do: leave_remote_update_ets(scope, scope_mon, mg, [pid], groups)
 
   defp leave_remote_update_ets(scope, scope_mon, mg, pids, groups) when is_list(pids) do
-    Enum.each(groups, fn group ->
-      case :ets.lookup(scope, group) do
-        [{_g, all, local}] ->
-          case all -- pids do
-            [] when local == [] -> :ets.delete(scope, group)
-            new_all -> :ets.insert(scope, {group, new_all, local})
-          end
+    for group <- groups,
+        [{_g, all, local}] <- [:ets.lookup(scope, group)] do
+      {popped, new_all} = pop_first_by_pids(all, pids)
 
-          notify_group(scope_mon, mg, :leave, group, pids)
-
-        [] ->
-          true
+      if new_all == [] and local == [] do
+        :ets.delete(scope, group)
+      else
+        :ets.insert(scope, {group, new_all, local})
       end
-    end)
+
+      if popped != [], do: notify_group(scope_mon, mg, :leave, group, popped)
+    end
+
+    :ok
   end
 
-  # --- remote group bookkeeping ---
+  # --- remote-peer bookkeeping (state.remote inner map) ---
 
-  defp join_remote(group, pid, remote_groups) when is_pid(pid) do
-    Map.update(remote_groups, group, [pid], fn list -> [pid | list] end)
+  defp join_remote(group, entries, remote_groups) when is_list(entries) do
+    Map.update(remote_groups, group, entries, fn list -> entries ++ list end)
   end
 
-  defp join_remote(group, pids, remote_groups) when is_list(pids) do
-    Map.update(remote_groups, group, pids, fn list -> pids ++ list end)
-  end
-
-  defp leave_remote(pid, remote_map, groups) when is_pid(pid),
-    do: leave_remote([pid], remote_map, groups)
+  defp leave_remote(pid, remote_map, groups) when is_pid(pid), do: leave_remote([pid], remote_map, groups)
 
   defp leave_remote(pids, remote_map, groups) do
     Enum.reduce(groups, remote_map, fn group, acc ->
-      case Map.get(acc, group, []) -- pids do
+      {_popped, remaining} = pop_first_by_pids(Map.get(acc, group, []), pids)
+
+      case remaining do
         [] -> Map.delete(acc, group)
-        remaining -> Map.put(acc, group, remaining)
+        rest -> Map.put(acc, group, rest)
       end
     end)
   end
@@ -518,36 +640,37 @@ defmodule PgRegistry.Pg do
   end
 
   defp sync_groups(scope, scope_mon, mg, remote_groups, []) do
-    Enum.each(remote_groups, fn {group, pids} ->
-      leave_remote_update_ets(scope, scope_mon, mg, pids, [group])
+    Enum.each(remote_groups, fn {group, entries} ->
+      leave_remote_update_ets(scope, scope_mon, mg, extract_pids(entries), [group])
     end)
   end
 
-  defp sync_groups(scope, scope_mon, mg, remote_groups, [{group, pids} | tail]) do
+  defp sync_groups(scope, scope_mon, mg, remote_groups, [{group, entries} | tail]) do
     case Map.pop(remote_groups, group) do
-      {^pids, new_remote_groups} ->
+      {^entries, new_remote_groups} ->
         sync_groups(scope, scope_mon, mg, new_remote_groups, tail)
 
       {nil, _} ->
-        join_remote_update_ets(scope, scope_mon, mg, group, pids)
+        join_remote_update_ets(scope, scope_mon, mg, group, entries)
         sync_groups(scope, scope_mon, mg, remote_groups, tail)
 
-      {old_pids, new_remote_groups} ->
-        [{_g, all_old, local_pids}] = :ets.lookup(scope, group)
-        all_new = pids ++ (all_old -- old_pids)
-        :ets.insert(scope, {group, all_new, local_pids})
+      {old_entries, new_remote_groups} ->
+        # Different from before — recompute the row's all-slot. Local slot
+        # is preserved (it's our own pids; the peer doesn't own them).
+        [{_g, all_old, local}] = :ets.lookup(scope, group)
+        all_new = entries ++ (all_old -- old_entries)
+        :ets.insert(scope, {group, all_new, local})
         sync_groups(scope, scope_mon, mg, new_remote_groups, tail)
     end
   end
 
-  defp all_local_pids(local) do
-    local
-    |> Enum.reduce(%{}, fn {pid, {_ref, groups}}, acc ->
-      Enum.reduce(groups, acc, fn g, acc1 ->
-        Map.update(acc1, g, [pid], fn list -> [pid | list] end)
-      end)
-    end)
-    |> Map.to_list()
+  # Walks the ETS table for rows whose local slot is non-empty and returns
+  # `[{group, [{pid, meta}]}, ...]`. ETS is the source of truth for meta;
+  # state.local doesn't store it.
+  defp all_local_entries(scope) do
+    :ets.select(scope, [
+      {{:"$1", :_, :"$2"}, [{:"=/=", :"$2", []}], [{{:"$1", :"$2"}}]}
+    ])
   end
 
   defp broadcast([], _msg), do: :ok
@@ -565,9 +688,9 @@ defmodule PgRegistry.Pg do
     end
   end
 
-  defp notify_group(scope_monitors, mg, action, group, pids) do
+  defp notify_group(scope_monitors, mg, action, group, entries) do
     Enum.each(scope_monitors, fn {ref, pid} ->
-      send(pid, {ref, action, group, pids})
+      send(pid, {ref, action, group, entries})
     end)
 
     case Map.fetch(mg, group) do
@@ -576,14 +699,15 @@ defmodule PgRegistry.Pg do
 
       {:ok, monitors} ->
         Enum.each(monitors, fn {pid, ref} ->
-          send(pid, {ref, action, group, pids})
+          send(pid, {ref, action, group, entries})
         end)
     end
   end
 
   defp flush(ref) do
     receive do
-      {^ref, verb, _group, _pids} when verb == :join or verb == :leave -> flush(ref)
+      {^ref, verb, _group, _payload} when verb in [:join, :leave, :update] ->
+        flush(ref)
     after
       0 -> :ok
     end

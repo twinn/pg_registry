@@ -9,7 +9,7 @@ defmodule PgRegistryTest do
 
   describe "start_link/1" do
     test "starts a pg scope", %{scope: scope} do
-      assert :ok == :pg.which_groups(scope) |> then(fn _ -> :ok end)
+      assert :ok == scope |> :pg.which_groups() |> then(fn _ -> :ok end)
     end
   end
 

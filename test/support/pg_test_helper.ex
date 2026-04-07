@@ -7,8 +7,10 @@ defmodule PgRegistry.Pg.TestHelper do
 
   alias PgRegistry.Pg
 
-  def member_loop(reply_to, scope, group) do
-    :ok = Pg.join(scope, group, self())
+  def member_loop(reply_to, scope, group), do: member_loop(reply_to, scope, group, nil)
+
+  def member_loop(reply_to, scope, group, meta) do
+    :ok = Pg.join(scope, group, self(), meta)
     send(reply_to, {:joined, self()})
     receive do: (:stop -> :ok)
   end

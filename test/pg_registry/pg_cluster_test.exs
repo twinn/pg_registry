@@ -37,14 +37,14 @@ defmodule PgRegistry.PgClusterTest do
     _ = :sys.get_state(scope)
   end
 
-  defp spawn_remote_member(peer_node, scope, group) do
+  defp spawn_remote_member(peer_node, scope, group, meta \\ nil) do
     parent = self()
 
     pid =
       :erpc.call(peer_node, :erlang, :spawn, [
         PgRegistry.Pg.TestHelper,
         :member_loop,
-        [parent, scope, group]
+        [parent, scope, group, meta]
       ])
 
     receive do: ({:joined, ^pid} -> :ok)
@@ -104,9 +104,33 @@ defmodule PgRegistry.PgClusterTest do
        %{scope: scope, peer_node: peer_node} do
     {ref, _} = Pg.monitor_scope(scope)
     remote_pid = spawn_remote_member(peer_node, scope, :watched)
-    assert_receive {^ref, :join, :watched, [^remote_pid]}, 1000
+    assert_receive {^ref, :join, :watched, [{^remote_pid, nil}]}, 1000
 
     :erpc.call(peer_node, Pg, :leave, [scope, :watched, remote_pid])
-    assert_receive {^ref, :leave, :watched, [^remote_pid]}, 1000
+    assert_receive {^ref, :leave, :watched, [{^remote_pid, nil}]}, 1000
+  end
+
+  test "remote join with metadata propagates the meta everywhere",
+       %{scope: scope, peer_node: peer_node} do
+    {ref, _} = Pg.monitor_scope(scope)
+    remote_pid = spawn_remote_member(peer_node, scope, :workers, %{role: :primary})
+
+    assert_receive {^ref, :join, :workers, [{^remote_pid, %{role: :primary}}]}, 1000
+    assert {remote_pid, %{role: :primary}} in Pg.lookup(scope, :workers)
+    # local node sees no local entries for this group
+    assert [] == Pg.lookup_local(scope, :workers)
+  end
+
+  test "remote update_meta is visible locally and notifies subscribers",
+       %{scope: scope, peer_node: peer_node} do
+    {ref, _} = Pg.monitor_scope(scope)
+    remote_pid = spawn_remote_member(peer_node, scope, :workers, :v1)
+    assert_receive {^ref, :join, :workers, [{^remote_pid, :v1}]}, 1000
+
+    # update_meta runs on the peer node (where the pid is local)
+    :ok = :erpc.call(peer_node, Pg, :update_meta, [scope, :workers, remote_pid, :v2])
+
+    assert_receive {^ref, :update, :workers, [{^remote_pid, :v1, :v2}]}, 1000
+    assert {remote_pid, :v2} in Pg.lookup(scope, :workers)
   end
 end
