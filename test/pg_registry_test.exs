@@ -8,8 +8,8 @@ defmodule PgRegistryTest do
   end
 
   describe "start_link/1" do
-    test "starts a pg scope", %{scope: scope} do
-      assert :ok == scope |> :pg.which_groups() |> then(fn _ -> :ok end)
+    test "starts a scope", %{scope: scope} do
+      assert is_list(PgRegistry.which_groups(scope))
     end
   end
 
@@ -48,7 +48,7 @@ defmodule PgRegistryTest do
       PgRegistry.register_name({scope, :my_key}, self())
 
       assert self() == PgRegistry.whereis_name({scope, :my_key})
-      assert [self()] == :pg.get_local_members(scope, :my_key)
+      assert [self()] == PgRegistry.Pg.get_local_members(scope, :my_key)
     end
 
     test "falls back to remote members when no local members exist", %{scope: scope} do
@@ -71,11 +71,11 @@ defmodule PgRegistryTest do
 
     test "only unregisters local members", %{scope: scope} do
       PgRegistry.register_name({scope, :my_key}, self())
-      assert [self()] == :pg.get_local_members(scope, :my_key)
+      assert [self()] == PgRegistry.Pg.get_local_members(scope, :my_key)
 
       PgRegistry.unregister_name({scope, :my_key})
 
-      assert [] == :pg.get_local_members(scope, :my_key)
+      assert [] == PgRegistry.Pg.get_local_members(scope, :my_key)
     end
   end
 
@@ -202,6 +202,239 @@ defmodule PgRegistryTest do
 
       Agent.update({:via, PgRegistry, {scope, :my_agent}}, &(&1 + 1))
       assert 1 == Agent.get({:via, PgRegistry, {scope, :my_agent}}, & &1)
+    end
+
+    test "3-element via tuple attaches a value at registration", %{scope: scope} do
+      {:ok, pid} =
+        Agent.start_link(fn -> :state end,
+          name: {:via, PgRegistry, {scope, :tagged_agent, %{role: :primary}}}
+        )
+
+      assert pid == PgRegistry.whereis_name({scope, :tagged_agent})
+      assert [{^pid, %{role: :primary}}] = PgRegistry.lookup(scope, :tagged_agent)
+    end
+  end
+
+  describe "lookup/2" do
+    test "returns [{pid, value}] entries", %{scope: scope} do
+      PgRegistry.register_name({scope, :worker, :tag1}, self())
+      assert [{self(), :tag1}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "value defaults to nil for the 2-tuple via name", %{scope: scope} do
+      PgRegistry.register_name({scope, :worker}, self())
+      assert [{self(), nil}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "returns [] for unknown key", %{scope: scope} do
+      assert [] == PgRegistry.lookup(scope, :nope)
+    end
+  end
+
+  describe "update_value/3" do
+    test "replaces the value for an entry", %{scope: scope} do
+      PgRegistry.register_name({scope, :worker, :before}, self())
+      assert :ok = PgRegistry.update_value(scope, :worker, self(), :after)
+      assert [{self(), :after}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "returns :not_joined when the pid isn't registered", %{scope: scope} do
+      assert :not_joined = PgRegistry.update_value(scope, :worker, self(), :anything)
+    end
+  end
+
+  describe "keys/2" do
+    test "returns all keys a pid is registered under", %{scope: scope} do
+      PgRegistry.register_name({scope, :a}, self())
+      PgRegistry.register_name({scope, :b}, self())
+      keys = PgRegistry.keys(scope, self())
+      assert :a in keys
+      assert :b in keys
+      assert length(keys) == 2
+    end
+
+    test "returns [] for an unregistered pid", %{scope: scope} do
+      assert [] == PgRegistry.keys(scope, self())
+    end
+
+    test "does not include keys registered by other pids", %{scope: scope} do
+      task =
+        Task.async(fn ->
+          PgRegistry.register_name({scope, :other}, self())
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(50)
+      PgRegistry.register_name({scope, :mine}, self())
+
+      assert [:mine] == PgRegistry.keys(scope, self())
+      Task.shutdown(task, :brutal_kill)
+    end
+  end
+
+  describe "register/3 and unregister/2" do
+    test "register/3 joins self() under key with value", %{scope: scope} do
+      assert {:ok, self()} == PgRegistry.register(scope, :worker, %{role: :primary})
+      assert [{self(), %{role: :primary}}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "unregister/2 removes self() from key", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :v)
+      assert :ok = PgRegistry.unregister(scope, :worker)
+      assert [] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "unregister/2 is a no-op when not registered", %{scope: scope} do
+      assert :ok = PgRegistry.unregister(scope, :nope)
+    end
+  end
+
+  describe "values/3" do
+    test "returns the values registered by the given pid for the key", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :a)
+      PgRegistry.register(scope, :worker, :b)
+
+      values = PgRegistry.values(scope, :worker, self())
+      assert :a in values
+      assert :b in values
+      assert length(values) == 2
+    end
+
+    test "returns [] for an unregistered pid", %{scope: scope} do
+      assert [] == PgRegistry.values(scope, :worker, self())
+    end
+  end
+
+  describe "match/3 and match/4" do
+    test "matches entries against a literal value", %{scope: scope} do
+      PgRegistry.register(scope, :worker, %{role: :primary})
+
+      task =
+        Task.async(fn ->
+          PgRegistry.register(scope, :worker, %{role: :replica})
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(50)
+
+      matches = PgRegistry.match(scope, :worker, %{role: :primary})
+      assert [{self(), %{role: :primary}}] == matches
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "match/4 supports guards", %{scope: scope} do
+      PgRegistry.register(scope, :worker, %{n: 1})
+      PgRegistry.register(scope, :worker, %{n: 5})
+      PgRegistry.register(scope, :worker, %{n: 10})
+
+      matches = PgRegistry.match(scope, :worker, %{n: :"$1"}, [{:>, :"$1", 3}])
+      assert length(matches) == 2
+      assert Enum.all?(matches, fn {_pid, %{n: n}} -> n > 3 end)
+    end
+
+    test "match returns [] when nothing matches", %{scope: scope} do
+      PgRegistry.register(scope, :worker, %{role: :primary})
+      assert [] == PgRegistry.match(scope, :worker, %{role: :replica})
+    end
+  end
+
+  describe "count_match/3 and count_match/4" do
+    test "counts matching entries", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :a)
+      PgRegistry.register(scope, :worker, :b)
+      PgRegistry.register(scope, :worker, :a)
+
+      assert 2 == PgRegistry.count_match(scope, :worker, :a)
+      assert 1 == PgRegistry.count_match(scope, :worker, :b)
+      assert 0 == PgRegistry.count_match(scope, :worker, :c)
+    end
+  end
+
+  describe "select/2" do
+    test "runs a Registry-shaped match-spec across the whole scope", %{scope: scope} do
+      PgRegistry.register(scope, :a, 1)
+      PgRegistry.register(scope, :a, 2)
+      PgRegistry.register(scope, :b, 3)
+
+      # match-spec input shape: {{key, pid, value}, guards, body}
+      spec = [{{:a, :"$1", :"$2"}, [], [{{:"$1", :"$2"}}]}]
+      result = PgRegistry.select(scope, spec)
+      assert length(result) == 2
+      assert Enum.all?(result, fn {pid, _v} -> pid == self() end)
+      assert Enum.sort(Enum.map(result, fn {_p, v} -> v end)) == [1, 2]
+    end
+
+    test "user match-specs see {key, pid, value} not the internal row shape", %{scope: scope} do
+      PgRegistry.register(scope, :a, %{important: true})
+
+      spec = [{{:_, :_, %{important: :"$1"}}, [{:==, :"$1", true}], [:"$_"]}]
+      assert length(PgRegistry.select(scope, spec)) == 1
+    end
+  end
+
+  describe "count_select/2" do
+    test "counts via a match-spec", %{scope: scope} do
+      PgRegistry.register(scope, :a, 1)
+      PgRegistry.register(scope, :a, 2)
+      PgRegistry.register(scope, :b, 3)
+
+      spec = [{{:a, :_, :_}, [], [true]}]
+      assert 2 == PgRegistry.count_select(scope, spec)
+    end
+  end
+
+  describe "unregister_match/3" do
+    test "unregisters self()'s entries that match", %{scope: scope} do
+      PgRegistry.register(scope, :worker, %{role: :primary})
+      PgRegistry.register(scope, :worker, %{role: :replica})
+
+      :ok = PgRegistry.unregister_match(scope, :worker, %{role: :replica})
+      assert [{self(), %{role: :primary}}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "leaves other pids' entries alone", %{scope: scope} do
+      task =
+        Task.async(fn ->
+          PgRegistry.register(scope, :worker, :keep)
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(50)
+      PgRegistry.register(scope, :worker, :remove_me)
+
+      :ok = PgRegistry.unregister_match(scope, :worker, :remove_me)
+
+      remaining = PgRegistry.lookup(scope, :worker)
+      assert length(remaining) == 1
+      assert {task.pid, :keep} in remaining
+
+      Task.shutdown(task, :brutal_kill)
+    end
+  end
+
+  describe "meta/2, put_meta/3, delete_meta/2" do
+    test "round-trip", %{scope: scope} do
+      assert :error = PgRegistry.meta(scope, :config)
+      assert :ok = PgRegistry.put_meta(scope, :config, %{retries: 3})
+      assert {:ok, %{retries: 3}} == PgRegistry.meta(scope, :config)
+
+      assert :ok = PgRegistry.delete_meta(scope, :config)
+      assert :error = PgRegistry.meta(scope, :config)
+    end
+  end
+
+  describe "count/1" do
+    test "returns 0 for an empty scope", %{scope: scope} do
+      assert 0 == PgRegistry.count(scope)
+    end
+
+    test "counts every entry, not just keys", %{scope: scope} do
+      PgRegistry.register_name({scope, :a}, self())
+      PgRegistry.register_name({scope, :b}, self())
+      # same pid registered twice under same key counts as two
+      PgRegistry.register_name({scope, :a}, self())
+      assert 3 == PgRegistry.count(scope)
     end
   end
 end
