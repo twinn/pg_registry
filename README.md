@@ -55,6 +55,7 @@ PgRegistry.whereis_name({:my_registry, :my_key})
 | Per-process values | yes | no | yes |
 | Match-spec queries | yes (ETS-native) | no | yes (ETS-native) |
 | Listeners | yes | no | yes |
+| Unique key mode | yes (in-table) | yes (cluster-wide) | yes (per-node only) |
 
 `Registry` is fast but local-only. `:global` is cluster-wide but
 synchronous and famously slow. PgRegistry sits in a third spot:
@@ -84,8 +85,8 @@ Supported options:
 - `:listeners` — list of registered process names that receive
   `{:register, scope, key, pid, value}` and
   `{:unregister, scope, key, pid}` messages on join/leave events
-- `:keys` — `:duplicate` (default, no-op). `:unique` raises with an
-  explanation; see [Cluster-wide uniqueness](#cluster-wide-uniqueness)
+- `:keys` — `:duplicate` (default) or `:unique`. `:unique` enforces
+  per-node uniqueness only; see [Per-node uniqueness](#per-node-uniqueness)
   below
 - `:partitions` — `1` (default, no-op). Anything greater raises; see
   [Partitions](#partitions) below
@@ -222,19 +223,47 @@ or no-ops if there are none.
 
 ## Design notes
 
-### Cluster-wide uniqueness
+### Per-node uniqueness
 
-PgRegistry deliberately does **not** support `keys: :unique`.
-`Registry`'s `:unique` mode means "unique within this ETS table on
-this node" — it has no cluster meaning. Lifting that to a real
-cluster-wide unique guarantee requires consensus or distributed
-locking, which is what `:global` does (and the reason `:global` is
-slow).
+PgRegistry supports `keys: :unique`, but **uniqueness is enforced
+per-node, not cluster-wide**. This is the same scope as `Registry`'s
+`:unique` mode, lifted into a distributed setting:
 
-If you need cluster-wide unique names, use `:global`. If you need
-single-node uniqueness only, enforce it in your application code
-before calling `register/3`. PgRegistry will raise an `ArgumentError`
-with a helpful message if you pass `keys: :unique`.
+- Within a single node, only one local pid can hold a given key. A
+  second `register/3` returns `{:error, {:already_registered, holder}}`.
+- Across the cluster, **each node can have its own holder** under the
+  same key. There is no cross-node arbitration.
+
+```elixir
+{PgRegistry, name: :singletons, keys: :unique}
+
+# On node A:
+{:ok, _} = PgRegistry.register(:singletons, :worker, :v)
+
+# Same node, second call (any pid):
+{:error, {:already_registered, ^pid_a}} =
+  PgRegistry.register(:singletons, :worker, :v)
+
+# Node B at the same time succeeds — its node has its own holder:
+{:ok, _} = PgRegistry.register(:singletons, :worker, :v)
+```
+
+The `:via` tuple integrates correctly: `register_name/2` returns `:no`
+on collision, so `GenServer.start_link(name: {:via, PgRegistry, ...})`
+surfaces `{:error, {:already_started, pid}}` automatically.
+
+When the holding process exits (or calls `unregister/2`), the key
+becomes available again on that node.
+
+**This is useful when you want a singleton per node** — one
+connection pool per node, one cache per node, one supervisor per
+node — without paying `:global`'s consensus tax. **It is not what
+you want for cluster-wide singletons.** If you need exactly-one
+across the cluster, use `:global` or a leader election library.
+
+Multi-pid joins (`Pg.join(scope, key, [p1, p2])`) raise
+`ArgumentError` in unique mode because they have no meaningful
+semantics — at most one of the pids could ever succeed.
 
 ### Partitions
 

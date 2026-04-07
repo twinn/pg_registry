@@ -72,7 +72,8 @@ defmodule PgRegistry.Pg do
     %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [scope]}}
   end
 
-  @spec join(scope(), group(), pid() | [pid()]) :: :ok
+  @spec join(scope(), group(), pid() | [pid()]) ::
+          :ok | {:error, {:already_registered, pid()}}
   def join(scope, group, pid_or_pids) when is_pid(pid_or_pids) or is_list(pid_or_pids) do
     join(scope, group, pid_or_pids, nil)
   end
@@ -83,11 +84,28 @@ defmodule PgRegistry.Pg do
   When a list of pids is given, the same `meta` is stored for each.
   A pid may be joined to the same group multiple times with different
   metas; each entry is independent and must be left separately.
+
+  In a scope started with `keys: :unique`, joining a key that's
+  already held by another local pid (or even the same pid again)
+  returns `{:error, {:already_registered, pid}}`. Multi-pid joins
+  raise `ArgumentError` because they have no meaningful semantics in
+  unique mode.
   """
-  @spec join(scope(), group(), pid() | [pid()], meta()) :: :ok
+  @spec join(scope(), group(), pid() | [pid()], meta()) ::
+          :ok | {:error, {:already_registered, pid()}}
   def join(scope, group, pid_or_pids, meta) when is_pid(pid_or_pids) or is_list(pid_or_pids) do
     :ok = ensure_local(pid_or_pids)
-    GenServer.call(scope, {:join_local, group, pid_or_pids, meta}, :infinity)
+
+    case GenServer.call(scope, {:join_local, group, pid_or_pids, meta}, :infinity) do
+      :ok ->
+        :ok
+
+      {:error, :unique_mode_requires_single_pid} ->
+        raise ArgumentError, "multi-pid join is not supported when keys: :unique"
+
+      {:error, {:already_registered, _}} = err ->
+        err
+    end
   end
 
   @spec leave(scope(), group(), pid() | [pid()]) :: :ok | :not_joined
@@ -229,7 +247,10 @@ defmodule PgRegistry.Pg do
               monitored_groups: %{},
               # [atom] — registered names that receive raw register/unregister
               # messages. Configured at start time, never changed afterward.
-              listeners: []
+              listeners: [],
+              # :duplicate (default) | :unique. Per-node uniqueness only —
+              # remote nodes are unaffected. See README.
+              keys: :duplicate
   end
 
   @impl true
@@ -246,26 +267,32 @@ defmodule PgRegistry.Pg do
     meta = meta_table(scope)
     ^meta = :ets.new(meta, [:set, :protected, :named_table, {:read_concurrency, true}])
 
-    {:ok, %State{scope: scope, listeners: Keyword.get(opts, :listeners, [])}}
+    keys =
+      case Keyword.get(opts, :keys, :duplicate) do
+        :duplicate -> :duplicate
+        :unique -> :unique
+        other -> raise ArgumentError, "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
+      end
+
+    {:ok,
+     %State{
+       scope: scope,
+       listeners: Keyword.get(opts, :listeners, []),
+       keys: keys
+     }}
   end
 
   @impl true
   def handle_call({:join_local, group, pid_or_pids, meta}, _from, %State{} = s) do
     pids = List.wrap(pid_or_pids)
-    raw_entries = for pid <- pids, do: {pid, meta, fresh_tag()}
 
-    new_local = Enum.reduce(raw_entries, s.local, &local_add(&1, group, &2))
+    case check_unique(s.keys, s.scope, group, pids) do
+      :ok ->
+        do_join_local(s, group, pids, meta)
 
-    for {pid, m, tag} <- raw_entries do
-      :ets.insert(s.scope, {group, pid, m, tag})
+      {:error, _} = err ->
+        {:reply, err, s}
     end
-
-    pub = strip_tags(raw_entries)
-    notify_group(s.scope_monitors, s.monitored_groups, :join, group, pub)
-    notify_listeners(s.listeners, s.scope, :register, group, pub)
-    broadcast(Map.keys(s.remote), {:join, self(), group, raw_entries})
-
-    {:reply, :ok, %{s | local: new_local}}
   end
 
   def handle_call({:leave_local, group, pid_or_pids}, _from, %State{} = s) do
@@ -528,6 +555,49 @@ defmodule PgRegistry.Pg do
   end
 
   defp ensure_local(bad), do: :erlang.error({:nolocal, bad})
+
+  # --- join helpers (used by handle_call({:join_local, ...})) ---
+
+  defp do_join_local(%State{} = s, group, pids, meta) do
+    raw_entries = for pid <- pids, do: {pid, meta, fresh_tag()}
+
+    new_local = Enum.reduce(raw_entries, s.local, &local_add(&1, group, &2))
+
+    for {pid, m, tag} <- raw_entries do
+      :ets.insert(s.scope, {group, pid, m, tag})
+    end
+
+    pub = strip_tags(raw_entries)
+    notify_group(s.scope_monitors, s.monitored_groups, :join, group, pub)
+    notify_listeners(s.listeners, s.scope, :register, group, pub)
+    broadcast(Map.keys(s.remote), {:join, self(), group, raw_entries})
+
+    {:reply, :ok, %{s | local: new_local}}
+  end
+
+  defp check_unique(:duplicate, _scope, _group, _pids), do: :ok
+  defp check_unique(:unique, _scope, _group, []), do: :ok
+
+  defp check_unique(:unique, scope, group, [_pid]) do
+    case find_local_holder(scope, group) do
+      nil -> :ok
+      existing -> {:error, {:already_registered, existing}}
+    end
+  end
+
+  # Caught at the public API boundary (Pg.join) and re-raised as
+  # ArgumentError. Reaching this case means the API didn't pre-check.
+  defp check_unique(:unique, _scope, _group, _multi_pids) do
+    {:error, :unique_mode_requires_single_pid}
+  end
+
+  defp find_local_holder(scope, group) do
+    scope
+    |> :ets.lookup(group)
+    |> Enum.find_value(fn {_g, pid, _m, _t} ->
+      if node(pid) == node(), do: pid
+    end)
+  end
 
   defp fresh_tag, do: :erlang.unique_integer([:monotonic])
 

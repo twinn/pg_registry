@@ -81,32 +81,20 @@ defmodule PgRegistry do
 
   # Splits Registry-shaped keyword opts into the scope name and the
   # subset of options that PgRegistry.Pg understands. Validates :keys
-  # and :partitions; both must be values that match what PgRegistry
-  # actually does, otherwise we error rather than silently doing the
-  # wrong thing.
+  # and :partitions; values that don't match what PgRegistry actually
+  # does raise loudly rather than silently degrading.
   defp parse_keyword_opts(opts) do
     scope = Keyword.fetch!(opts, :name)
 
-    case Keyword.get(opts, :keys, :duplicate) do
-      :duplicate ->
-        :ok
+    keys =
+      case Keyword.get(opts, :keys, :duplicate) do
+        mode when mode in [:duplicate, :unique] ->
+          mode
 
-      :unique ->
-        raise ArgumentError, """
-        PgRegistry does not support `keys: :unique`. PgRegistry is a
-        cluster-aware process group registry — every node accepts joins
-        independently and the cluster converges via gossip, so there is
-        no place to enforce per-key uniqueness without re-introducing
-        cluster-wide locking (which is what `:global` does).
-
-        If you need per-node uniqueness only, enforce it in your
-        application code before calling `register/3`. If you need
-        cluster-wide unique names, use `:global`.
-        """
-
-      other ->
-        raise ArgumentError, "expected :keys to be :duplicate, got: #{inspect(other)}"
-    end
+        other ->
+          raise ArgumentError,
+                "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
+      end
 
     case Keyword.get(opts, :partitions, 1) do
       1 ->
@@ -128,7 +116,11 @@ defmodule PgRegistry do
         raise ArgumentError, "expected :partitions to be 1, got: #{inspect(other)}"
     end
 
-    pg_opts = Keyword.take(opts, [:listeners])
+    pg_opts =
+      opts
+      |> Keyword.take([:listeners])
+      |> Keyword.put(:keys, keys)
+
     {scope, pg_opts}
   end
 
@@ -137,20 +129,23 @@ defmodule PgRegistry do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Registers `pid` under `{scope, key}` or `{scope, key, value}`. Always
-  returns `:yes`. Multiple processes can register under the same key,
-  and the same pid can register multiple times. Implements the `:via`
-  callback.
-  """
-  @spec register_name(via_name(), pid()) :: :yes
-  def register_name({scope, key}, pid) do
-    Pg.join(scope, key, pid)
-    :yes
-  end
+  Registers `pid` under `{scope, key}` or `{scope, key, value}`.
 
-  def register_name({scope, key, value}, pid) do
-    Pg.join(scope, key, pid, value)
-    :yes
+  Returns `:yes` on success, or `:no` if the scope was started with
+  `keys: :unique` and another local pid already holds this key.
+  Implements the `:via` callback — `:no` causes
+  `GenServer.start_link(name: {:via, ...})` to surface
+  `{:error, {:already_started, pid}}` automatically.
+  """
+  @spec register_name(via_name(), pid()) :: :yes | :no
+  def register_name({scope, key}, pid), do: do_register_name(scope, key, pid, nil)
+  def register_name({scope, key, value}, pid), do: do_register_name(scope, key, pid, value)
+
+  defp do_register_name(scope, key, pid, value) do
+    case Pg.join(scope, key, pid, value) do
+      :ok -> :yes
+      {:error, {:already_registered, _}} -> :no
+    end
   end
 
   @doc """
@@ -298,13 +293,17 @@ defmodule PgRegistry do
   @doc """
   Registers the calling process under `key` in `scope` with `value`.
 
-  Always returns `{:ok, self()}` because PgRegistry permits multiple
-  processes per key (equivalent to `Registry`'s `keys: :duplicate` mode).
+  Returns `{:ok, self()}` on success. In a scope started with
+  `keys: :unique`, returns `{:error, {:already_registered, pid}}`
+  if another local pid already holds the key.
   """
-  @spec register(scope(), key(), value()) :: {:ok, pid()}
+  @spec register(scope(), key(), value()) ::
+          {:ok, pid()} | {:error, {:already_registered, pid()}}
   def register(scope, key, value) do
-    Pg.join(scope, key, self(), value)
-    {:ok, self()}
+    case Pg.join(scope, key, self(), value) do
+      :ok -> {:ok, self()}
+      {:error, {:already_registered, _}} = err -> err
+    end
   end
 
   @doc """

@@ -144,6 +144,78 @@ defmodule PgRegistry.PgTest do
     end
   end
 
+  describe "keys: :unique mode" do
+    setup do
+      scope = :"pg_uniq_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({Pg, {scope, [keys: :unique]}})
+      {:ok, scope: scope}
+    end
+
+    test "first join succeeds, second join under same key fails", %{scope: scope} do
+      assert :ok = Pg.join(scope, :singleton, self())
+
+      assert {:error, {:already_registered, holder}} =
+               Pg.join(scope, :singleton, self())
+
+      assert holder == self()
+    end
+
+    test "another local pid is also blocked", %{scope: scope} do
+      :ok = Pg.join(scope, :singleton, self())
+
+      task =
+        Task.async(fn ->
+          Pg.join(scope, :singleton, self())
+        end)
+
+      assert {:error, {:already_registered, holder}} = Task.await(task)
+      assert holder == self()
+    end
+
+    test "key becomes available again after the holder leaves", %{scope: scope} do
+      :ok = Pg.join(scope, :singleton, self())
+      :ok = Pg.leave(scope, :singleton, self())
+      assert :ok = Pg.join(scope, :singleton, self())
+    end
+
+    test "key becomes available again after the holder dies", %{scope: scope} do
+      task =
+        Task.async(fn ->
+          Pg.join(scope, :singleton, self())
+          send(self(), :registered)
+        end)
+
+      Task.await(task)
+      # Give the DOWN handler time to clean up
+      _ = :sys.get_state(scope)
+
+      assert :ok = Pg.join(scope, :singleton, self())
+    end
+
+    test "different keys are independent", %{scope: scope} do
+      :ok = Pg.join(scope, :a, self())
+      assert :ok = Pg.join(scope, :b, self())
+    end
+
+    test "multi-pid join is rejected", %{scope: scope} do
+      task =
+        Task.async(fn ->
+          Process.sleep(:infinity)
+        end)
+
+      assert_raise ArgumentError, fn ->
+        Pg.join(scope, :singleton, [self(), task.pid])
+      end
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "metadata is still attached on join", %{scope: scope} do
+      :ok = Pg.join(scope, :singleton, self(), %{role: :primary})
+      assert [{self(), %{role: :primary}}] == Pg.lookup(scope, :singleton)
+    end
+  end
+
   describe "join/4 with metadata" do
     test "single pid with metadata", %{scope: scope} do
       assert :ok = Pg.join(scope, :g, self(), %{role: :primary})

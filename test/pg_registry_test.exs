@@ -256,6 +256,50 @@ defmodule PgRegistryTest do
     end
   end
 
+  describe "keys: :unique (per-node)" do
+    test "register/3 returns error on collision" do
+      scope = :"pg_uniq_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :unique})
+
+      assert {:ok, _} = PgRegistry.register(scope, :singleton, :first)
+
+      assert {:error, {:already_registered, holder}} =
+               PgRegistry.register(scope, :singleton, :second)
+
+      assert holder == self()
+    end
+
+    test "register_name/2 returns :no on collision" do
+      scope = :"pg_uniq_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :unique})
+
+      assert :yes = PgRegistry.register_name({scope, :singleton}, self())
+      assert :no = PgRegistry.register_name({scope, :singleton}, self())
+    end
+
+    test "via tuple integrates with GenServer.start_link in unique mode" do
+      scope = :"pg_uniq_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :unique})
+
+      {:ok, agent1} =
+        Agent.start_link(fn -> :a end, name: {:via, PgRegistry, {scope, :singleton}})
+
+      assert {:error, {:already_started, ^agent1}} =
+               Agent.start_link(fn -> :b end, name: {:via, PgRegistry, {scope, :singleton}})
+    end
+
+    test "key released after the registered process exits" do
+      scope = :"pg_uniq_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :unique})
+
+      task = Task.async(fn -> PgRegistry.register(scope, :singleton, :v) end)
+      assert {:ok, _} = Task.await(task)
+
+      _ = :sys.get_state(scope)
+      assert {:ok, _} = PgRegistry.register(scope, :singleton, :v)
+    end
+  end
+
   describe "Registry-shaped start_link/1 (keyword form)" do
     test "accepts a keyword list with :name" do
       scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
@@ -278,10 +322,10 @@ defmodule PgRegistryTest do
       assert is_pid(Process.whereis(scope))
     end
 
-    test "raises with a helpful error for keys: :unique" do
-      assert_raise ArgumentError, ~r/:unique/, fn ->
-        PgRegistry.start_link(name: :pg_kw_unique, keys: :unique)
-      end
+    test "accepts keys: :unique (per-node uniqueness)" do
+      scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :unique})
+      assert is_pid(Process.whereis(scope))
     end
 
     test "accepts partitions: 1 as a no-op" do

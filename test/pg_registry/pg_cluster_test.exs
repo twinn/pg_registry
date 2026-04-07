@@ -131,6 +131,32 @@ defmodule PgRegistry.PgClusterTest do
     assert [] == Pg.lookup_local(scope, :workers)
   end
 
+  test "keys: :unique is per-node — each node holds its own registration",
+       %{peer_node: peer_node} do
+    scope = :"pg_uniq_cluster_#{:erlang.unique_integer([:positive])}"
+
+    # Both nodes start the same scope in unique mode
+    {:ok, _} = Pg.start(scope, keys: :unique)
+    {:ok, _} = :erpc.call(peer_node, Pg, :start, [scope, [keys: :unique]])
+
+    # Local node registers a singleton
+    :ok = Pg.join(scope, :singleton, self())
+
+    # Peer node also registers a singleton — should succeed because
+    # uniqueness is local-only
+    remote_pid = spawn_remote_member(peer_node, scope, :singleton)
+
+    sync(scope, peer_node)
+
+    members = Pg.get_members(scope, :singleton)
+    assert self() in members
+    assert remote_pid in members
+    # Local view: only our pid is local
+    assert [self()] == Pg.get_local_members(scope, :singleton)
+    # Local re-register still fails
+    assert {:error, {:already_registered, _}} = Pg.join(scope, :singleton, self())
+  end
+
   test "remote update_meta is visible locally and notifies subscribers",
        %{scope: scope, peer_node: peer_node} do
     {ref, _} = Pg.monitor_scope(scope)
