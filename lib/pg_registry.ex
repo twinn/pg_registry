@@ -34,16 +34,102 @@ defmodule PgRegistry do
 
   @doc """
   Starts a `PgRegistry` scope.
+
+  Three forms are accepted:
+
+      PgRegistry.start_link(:my_reg)
+      PgRegistry.start_link(:my_reg, listeners: [MyL])
+      PgRegistry.start_link(name: :my_reg, listeners: [MyL], keys: :duplicate)
+
+  The third (keyword) form mirrors `Registry.start_link/1` for users
+  porting from Registry. `:keys` may be `:duplicate` (a no-op) but
+  `:unique` raises — see the README for the rationale. `:partitions`
+  is accepted and silently ignored.
   """
-  @spec start_link(scope()) :: GenServer.on_start()
+  @spec start_link(scope() | keyword()) :: GenServer.on_start()
   def start_link(scope) when is_atom(scope), do: Pg.start_link(scope)
+
+  def start_link(opts) when is_list(opts) do
+    {scope, pg_opts} = parse_keyword_opts(opts)
+    Pg.start_link(scope, pg_opts)
+  end
+
+  @spec start_link(scope(), keyword()) :: GenServer.on_start()
+  def start_link(scope, opts) when is_atom(scope) and is_list(opts) do
+    Pg.start_link(scope, opts)
+  end
 
   @doc """
   Returns a child specification for use in a supervision tree.
+
+  Accepts a bare scope atom, a `{scope, opts}` tuple, or a Registry-shaped
+  keyword list with `:name`.
   """
-  @spec child_spec(scope()) :: Supervisor.child_spec()
-  def child_spec(scope) do
+  @spec child_spec(scope() | {scope(), keyword()} | keyword()) :: Supervisor.child_spec()
+  def child_spec({scope, opts}) when is_atom(scope) and is_list(opts) do
+    %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [scope, opts]}}
+  end
+
+  def child_spec(scope) when is_atom(scope) do
     %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [scope]}}
+  end
+
+  def child_spec(opts) when is_list(opts) do
+    {scope, _} = parse_keyword_opts(opts)
+    %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [opts]}}
+  end
+
+  # Splits Registry-shaped keyword opts into the scope name and the
+  # subset of options that PgRegistry.Pg understands. Validates :keys
+  # and :partitions; both must be values that match what PgRegistry
+  # actually does, otherwise we error rather than silently doing the
+  # wrong thing.
+  defp parse_keyword_opts(opts) do
+    scope = Keyword.fetch!(opts, :name)
+
+    case Keyword.get(opts, :keys, :duplicate) do
+      :duplicate ->
+        :ok
+
+      :unique ->
+        raise ArgumentError, """
+        PgRegistry does not support `keys: :unique`. PgRegistry is a
+        cluster-aware process group registry — every node accepts joins
+        independently and the cluster converges via gossip, so there is
+        no place to enforce per-key uniqueness without re-introducing
+        cluster-wide locking (which is what `:global` does).
+
+        If you need per-node uniqueness only, enforce it in your
+        application code before calling `register/3`. If you need
+        cluster-wide unique names, use `:global`.
+        """
+
+      other ->
+        raise ArgumentError, "expected :keys to be :duplicate, got: #{inspect(other)}"
+    end
+
+    case Keyword.get(opts, :partitions, 1) do
+      1 ->
+        :ok
+
+      n when is_integer(n) and n > 1 ->
+        raise ArgumentError, """
+        PgRegistry does not support `partitions: #{n}`. PgRegistry uses
+        a single ETS table per scope; partitioning would shard local
+        writes across N GenServers but does not help with the
+        gossip/convergence path that dominates cost in a cluster.
+
+        If you hit local write contention on a single scope, the right
+        fix is usually to split the scope into several scopes (one per
+        logical workload), not to partition a single one.
+        """
+
+      other ->
+        raise ArgumentError, "expected :partitions to be 1, got: #{inspect(other)}"
+    end
+
+    pg_opts = Keyword.take(opts, [:listeners])
+    {scope, pg_opts}
   end
 
   # ---------------------------------------------------------------------------
@@ -138,6 +224,16 @@ defmodule PgRegistry do
   @spec update_value(scope(), key(), pid(), value()) :: :ok | :not_joined
   def update_value(scope, key, pid, new_value) when is_pid(pid) do
     Pg.update_meta(scope, key, pid, new_value)
+  end
+
+  @doc """
+  Sugar for `update_value/4` that updates the calling process's entry.
+  Closer in shape to `Registry.update_value/3` but takes a literal value
+  rather than a callback.
+  """
+  @spec update_value(scope(), key(), value()) :: :ok | :not_joined
+  def update_value(scope, key, new_value) do
+    update_value(scope, key, self(), new_value)
   end
 
   @doc """

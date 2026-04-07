@@ -231,15 +231,103 @@ defmodule PgRegistryTest do
     end
   end
 
-  describe "update_value/3" do
-    test "replaces the value for an entry", %{scope: scope} do
+  describe "update_value/3 and update_value/4" do
+    test "update_value/4 replaces the value for a specific pid", %{scope: scope} do
       PgRegistry.register_name({scope, :worker, :before}, self())
       assert :ok = PgRegistry.update_value(scope, :worker, self(), :after)
       assert [{self(), :after}] == PgRegistry.lookup(scope, :worker)
     end
 
-    test "returns :not_joined when the pid isn't registered", %{scope: scope} do
+    test "update_value/4 returns :not_joined when the pid isn't registered", %{scope: scope} do
       assert :not_joined = PgRegistry.update_value(scope, :worker, self(), :anything)
+    end
+
+    test "update_value/3 is sugar for update_value/4 with self()", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :v1)
+      assert :ok = PgRegistry.update_value(scope, :worker, :v2)
+      assert [{self(), :v2}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "update_value/3 returns :not_joined when self() isn't registered", %{scope: scope} do
+      assert :not_joined = PgRegistry.update_value(scope, :worker, :anything)
+    end
+  end
+
+  describe "Registry-shaped start_link/1 (keyword form)" do
+    test "accepts a keyword list with :name" do
+      scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope})
+      assert is_pid(Process.whereis(scope))
+    end
+
+    test "passes :listeners through" do
+      {listener, _} = spawn_listener(self())
+      scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, listeners: [listener]})
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v1)
+      assert_receive {:register, ^scope, :worker, _, :v1}
+    end
+
+    test "accepts keys: :duplicate as a no-op" do
+      scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, keys: :duplicate})
+      assert is_pid(Process.whereis(scope))
+    end
+
+    test "raises with a helpful error for keys: :unique" do
+      assert_raise ArgumentError, ~r/:unique/, fn ->
+        PgRegistry.start_link(name: :pg_kw_unique, keys: :unique)
+      end
+    end
+
+    test "accepts partitions: 1 as a no-op" do
+      scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, name: scope, partitions: 1})
+      assert is_pid(Process.whereis(scope))
+    end
+
+    test "raises with a helpful error for partitions > 1" do
+      assert_raise ArgumentError, ~r/partitions: 4/, fn ->
+        PgRegistry.start_link(name: :pg_kw_partitioned, partitions: 4)
+      end
+    end
+
+    test ":name is required" do
+      assert_raise KeyError, fn -> PgRegistry.start_link([]) end
+    end
+
+    # Forwarder helper duplicated from the listeners describe so this
+    # block doesn't reach into the other one's setup.
+    defp spawn_listener(target) do
+      name = :"pg_listener_kw_#{:erlang.unique_integer([:positive])}"
+
+      pid =
+        spawn_link(fn ->
+          Process.register(self(), name)
+          loop(target)
+        end)
+
+      :ok = wait_named(name)
+      {name, pid}
+    end
+
+    defp loop(target) do
+      receive do
+        msg ->
+          send(target, msg)
+          loop(target)
+      end
+    end
+
+    defp wait_named(name) do
+      if Process.whereis(name),
+        do: :ok,
+        else:
+          (
+            Process.sleep(1)
+            wait_named(name)
+          )
     end
   end
 
@@ -410,6 +498,110 @@ defmodule PgRegistryTest do
       assert {task.pid, :keep} in remaining
 
       Task.shutdown(task, :brutal_kill)
+    end
+  end
+
+  describe "listeners" do
+    # Spawns a tiny process registered under `name` that forwards every
+    # message it receives to the test process. Lets us use multiple
+    # listener atoms even though the test process can only have one
+    # registered name itself.
+    defp spawn_forwarder(target) do
+      name = :"pg_listener_#{:erlang.unique_integer([:positive])}"
+
+      pid =
+        spawn_link(fn ->
+          Process.register(self(), name)
+          forward_loop(target)
+        end)
+
+      # wait until the name is bound
+      wait_registered(name)
+      {name, pid}
+    end
+
+    defp forward_loop(target) do
+      receive do
+        msg ->
+          send(target, msg)
+          forward_loop(target)
+      end
+    end
+
+    defp wait_registered(name) do
+      if Process.whereis(name),
+        do: :ok,
+        else:
+          (
+            Process.sleep(1)
+            wait_registered(name)
+          )
+    end
+
+    test "delivers :register on join" do
+      {listener, _} = spawn_forwarder(self())
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [listener]}})
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v1)
+
+      me = self()
+      assert_receive {:register, ^scope, :worker, ^me, :v1}
+    end
+
+    test "delivers :unregister on leave" do
+      {listener, _} = spawn_forwarder(self())
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [listener]}})
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v1)
+      assert_receive {:register, ^scope, :worker, _, :v1}
+
+      :ok = PgRegistry.unregister(scope, :worker)
+      me = self()
+      assert_receive {:unregister, ^scope, :worker, ^me}
+    end
+
+    test "does NOT deliver on update_value" do
+      {listener, _} = spawn_forwarder(self())
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [listener]}})
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :old)
+      assert_receive {:register, ^scope, :worker, _, :old}
+
+      :ok = PgRegistry.update_value(scope, :worker, self(), :new)
+      refute_receive {:register, ^scope, _, _, _}, 50
+      refute_receive {:unregister, ^scope, _, _}, 50
+    end
+
+    test "fans out to multiple listeners" do
+      {l1, _} = spawn_forwarder(self())
+      {l2, _} = spawn_forwarder(self())
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [l1, l2]}})
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v1)
+      assert_receive {:register, ^scope, :worker, _, :v1}
+      assert_receive {:register, ^scope, :worker, _, :v1}
+    end
+
+    test "delivers :unregister when a registered process exits" do
+      {listener, _} = spawn_forwarder(self())
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [listener]}})
+
+      task =
+        Task.async(fn ->
+          PgRegistry.register(scope, :worker, :v)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:register, ^scope, :worker, pid, :v}
+      assert pid == task.pid
+
+      Task.shutdown(task, :brutal_kill)
+      assert_receive {:unregister, ^scope, :worker, ^pid}
     end
   end
 

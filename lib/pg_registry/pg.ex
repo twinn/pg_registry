@@ -35,18 +35,40 @@ defmodule PgRegistry.Pg do
   # ---------------------------------------------------------------------------
 
   @spec start_link(scope()) :: GenServer.on_start()
-  def start_link(scope) when is_atom(scope) do
-    GenServer.start_link(__MODULE__, scope, name: scope)
+  def start_link(scope) when is_atom(scope), do: start_link(scope, [])
+
+  @doc """
+  Starts a scope linked to the caller, with options.
+
+  ## Options
+
+    * `:listeners` — a list of locally-registered process names that
+      will receive raw `{:register, scope, key, pid, value}` and
+      `{:unregister, scope, key, pid}` messages whenever entries are
+      added or removed. Matches Elixir's `Registry` listener semantics.
+      Listeners are local-only; they fire on this node for both
+      locally-originated and gossiped events.
+  """
+  @spec start_link(scope(), keyword()) :: GenServer.on_start()
+  def start_link(scope, opts) when is_atom(scope) and is_list(opts) do
+    GenServer.start_link(__MODULE__, {scope, opts}, name: scope)
   end
 
   @doc "Starts a scope outside of any supervision/link tree."
   @spec start(scope()) :: GenServer.on_start()
-  def start(scope) when is_atom(scope) do
-    GenServer.start(__MODULE__, scope, name: scope)
+  def start(scope) when is_atom(scope), do: start(scope, [])
+
+  @spec start(scope(), keyword()) :: GenServer.on_start()
+  def start(scope, opts) when is_atom(scope) and is_list(opts) do
+    GenServer.start(__MODULE__, {scope, opts}, name: scope)
   end
 
-  @spec child_spec(scope()) :: Supervisor.child_spec()
-  def child_spec(scope) do
+  @spec child_spec(scope() | {scope(), keyword()}) :: Supervisor.child_spec()
+  def child_spec({scope, opts}) when is_atom(scope) and is_list(opts) do
+    %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [scope, opts]}}
+  end
+
+  def child_spec(scope) when is_atom(scope) do
     %{id: {__MODULE__, scope}, start: {__MODULE__, :start_link, [scope]}}
   end
 
@@ -204,11 +226,14 @@ defmodule PgRegistry.Pg do
               # %{ref => {pid, group}} — single-group subscribers (forward map)
               group_monitors: %{},
               # %{group => [{pid, ref}, ...]} — single-group subscribers (reverse)
-              monitored_groups: %{}
+              monitored_groups: %{},
+              # [atom] — registered names that receive raw register/unregister
+              # messages. Configured at start time, never changed afterward.
+              listeners: []
   end
 
   @impl true
-  def init(scope) do
+  def init({scope, opts}) do
     :ok = :net_kernel.monitor_nodes(true)
 
     for node <- Node.list() do
@@ -221,7 +246,7 @@ defmodule PgRegistry.Pg do
     meta = meta_table(scope)
     ^meta = :ets.new(meta, [:set, :protected, :named_table, {:read_concurrency, true}])
 
-    {:ok, %State{scope: scope}}
+    {:ok, %State{scope: scope, listeners: Keyword.get(opts, :listeners, [])}}
   end
 
   @impl true
@@ -237,6 +262,7 @@ defmodule PgRegistry.Pg do
 
     pub = strip_tags(raw_entries)
     notify_group(s.scope_monitors, s.monitored_groups, :join, group, pub)
+    notify_listeners(s.listeners, s.scope, :register, group, pub)
     broadcast(Map.keys(s.remote), {:join, self(), group, raw_entries})
 
     {:reply, :ok, %{s | local: new_local}}
@@ -253,6 +279,7 @@ defmodule PgRegistry.Pg do
 
       if pub != [] do
         notify_group(s.scope_monitors, s.monitored_groups, :leave, group, pub)
+        notify_listeners(s.listeners, s.scope, :unregister, group, pub)
       end
 
       broadcast_leaves(s.remote, group, removed)
@@ -339,6 +366,7 @@ defmodule PgRegistry.Pg do
 
         pub = strip_tags(raw_entries)
         notify_group(s.scope_monitors, s.monitored_groups, :join, group, pub)
+        notify_listeners(s.listeners, s.scope, :register, group, pub)
 
         new_remote_groups =
           Map.update(remote_groups, group, raw_entries, &(raw_entries ++ &1))
@@ -357,6 +385,7 @@ defmodule PgRegistry.Pg do
 
         for {g, pub} <- leaves_by_group do
           notify_group(s.scope_monitors, s.monitored_groups, :leave, g, pub)
+          notify_listeners(s.listeners, s.scope, :unregister, g, pub)
         end
 
         new_remote_groups = remove_remote_triples(remote_groups, leave_triples)
@@ -396,8 +425,13 @@ defmodule PgRegistry.Pg do
 
       {{^mref, entries}, new_local} ->
         triples = down_local_pid(s.scope, pid, entries)
-        notify_local_down(s.scope_monitors, s.monitored_groups, triples)
-        broadcast(Map.keys(s.remote), {:leave, self(), Enum.map(triples, fn {g, p, _m, t} -> {g, p, t} end)})
+        notify_local_down(s.scope_monitors, s.monitored_groups, s.listeners, s.scope, triples)
+
+        broadcast(
+          Map.keys(s.remote),
+          {:leave, self(), Enum.map(triples, fn {g, p, _m, t} -> {g, p, t} end)}
+        )
+
         {:noreply, %{s | local: new_local}}
     end
   end
@@ -411,7 +445,9 @@ defmodule PgRegistry.Pg do
         end
 
         for {group, entries} <- remote_map do
-          notify_group(s.scope_monitors, s.monitored_groups, :leave, group, strip_tags(entries))
+          pub = strip_tags(entries)
+          notify_group(s.scope_monitors, s.monitored_groups, :leave, group, pub)
+          notify_listeners(s.listeners, s.scope, :unregister, group, pub)
         end
 
         {:noreply, %{s | remote: new_remote}}
@@ -610,11 +646,12 @@ defmodule PgRegistry.Pg do
     end
   end
 
-  defp notify_local_down(scope_mon, mg, triples) do
+  defp notify_local_down(scope_mon, mg, listeners, scope, triples) do
     triples
     |> Enum.group_by(fn {g, _, _, _} -> g end, fn {_, p, m, _} -> {p, m} end)
     |> Enum.each(fn {g, pub} ->
       notify_group(scope_mon, mg, :leave, g, pub)
+      notify_listeners(listeners, scope, :unregister, g, pub)
     end)
   end
 
@@ -739,6 +776,28 @@ defmodule PgRegistry.Pg do
       {:ok, tags} -> Map.put(mg, group, tags -- [tag])
       :error -> mg
     end
+  end
+
+  # Sends Registry-shaped raw messages to each configured listener.
+  # `verb` is `:register` or `:unregister`. For `:register`, `entries`
+  # are `[{pid, meta}]` pairs (we synthesize one message per pid). For
+  # `:unregister`, `entries` are `[{pid, _}]` and we drop the meta.
+  defp notify_listeners([], _scope, _verb, _group, _entries), do: :ok
+
+  defp notify_listeners(listeners, scope, :register, group, entries) do
+    for listener <- listeners, {pid, meta} <- entries do
+      send(listener, {:register, scope, group, pid, meta})
+    end
+
+    :ok
+  end
+
+  defp notify_listeners(listeners, scope, :unregister, group, entries) do
+    for listener <- listeners, {pid, _meta} <- entries do
+      send(listener, {:unregister, scope, group, pid})
+    end
+
+    :ok
   end
 
   defp notify_group(scope_monitors, mg, action, group, payload) do
