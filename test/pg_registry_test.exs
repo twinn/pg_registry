@@ -300,6 +300,50 @@ defmodule PgRegistryTest do
     end
   end
 
+  describe "option validation in 2-arity start_link" do
+    test "rejects partitions > 1 in the 2-arity form" do
+      assert_raise ArgumentError, ~r/partitions/, fn ->
+        PgRegistry.start_link(:pg_2arity_part, partitions: 4)
+      end
+    end
+
+    test "rejects unknown options in the 2-arity form" do
+      assert_raise ArgumentError, ~r/unknown/, fn ->
+        PgRegistry.start_link(:pg_2arity_unknown, made_up_option: 1)
+      end
+    end
+
+    test "accepts the same options as the keyword form" do
+      scope = :"pg_2arity_ok_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [], keys: :duplicate, partitions: 1}})
+      assert is_pid(Process.whereis(scope))
+    end
+  end
+
+  describe "subscription delegations" do
+    test "PgRegistry.monitor_scope/1 delivers events", %{scope: scope} do
+      {ref, _snapshot} = PgRegistry.monitor_scope(scope)
+      {:ok, _} = PgRegistry.register(scope, :worker, :v)
+      me = self()
+      assert_receive {^ref, :join, :worker, [{^me, :v}]}
+    end
+
+    test "PgRegistry.monitor/2 delivers events for one key", %{scope: scope} do
+      {ref, []} = PgRegistry.monitor(scope, :worker)
+      {:ok, _} = PgRegistry.register(scope, :worker, :v)
+      me = self()
+      assert_receive {^ref, :join, :worker, [{^me, :v}]}
+    end
+
+    test "PgRegistry.demonitor/2 stops further events", %{scope: scope} do
+      {ref, _} = PgRegistry.monitor_scope(scope)
+      assert :ok = PgRegistry.demonitor(scope, ref)
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v)
+      refute_receive {^ref, _, _, _}, 50
+    end
+  end
+
   describe "Registry-shaped start_link/1 (keyword form)" do
     test "accepts a keyword list with :name" do
       scope = :"pg_kw_#{:erlang.unique_integer([:positive])}"

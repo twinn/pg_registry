@@ -322,6 +322,8 @@ defmodule PgRegistry.Pg do
     end
   end
 
+  def handle_call({:leave_local, _group, []}, _from, %State{} = s), do: {:reply, :ok, s}
+
   def handle_call({:leave_local, group, pid_or_pids}, _from, %State{} = s) do
     pids = List.wrap(pid_or_pids)
     {removed, new_local} = pop_local_entries(pids, group, s.local)
@@ -655,7 +657,7 @@ defmodule PgRegistry.Pg do
   defp check_unique(:unique, _scope, _group, []), do: :ok
 
   defp check_unique(:unique, scope, group, [_pid]) do
-    case find_local_holder(scope, group) do
+    case find_live_local_holder(scope, group) do
       nil -> :ok
       existing -> {:error, {:already_registered, existing}}
     end
@@ -667,11 +669,17 @@ defmodule PgRegistry.Pg do
     {:error, :unique_mode_requires_single_pid}
   end
 
-  defp find_local_holder(scope, group) do
+  # Returns the first local pid registered under `group` whose process
+  # is still alive, or `nil` if there is no such pid. Skipping dead
+  # holders closes the race window where a `:DOWN` for the previous
+  # holder is queued in the GenServer mailbox but hasn't been processed
+  # yet — without this, a subsequent `Pg.join` in unique mode would
+  # spuriously fail with `{:already_registered, dead_pid}`.
+  defp find_live_local_holder(scope, group) do
     scope
     |> :ets.lookup(group)
     |> Enum.find_value(fn {_g, pid, _m, _t} ->
-      if node(pid) == node(), do: pid
+      if node(pid) == node() and Process.alive?(pid), do: pid
     end)
   end
 
@@ -802,17 +810,16 @@ defmodule PgRegistry.Pg do
   end
 
   defp down_local_pid(scope, pid, entries) do
-    for {group, tag} <- entries do
-      case :ets.match_object(scope, {group, pid, :_, tag}) do
-        [{^group, ^pid, meta, ^tag}] ->
-          :ets.match_delete(scope, {group, pid, :_, tag})
-          {group, pid, meta, tag}
-
-        [] ->
-          # row already gone (rare race) — synthesize with nil meta so
-          # subscribers still see something consistent
-          {group, pid, nil, tag}
-      end
+    # If state.local says the pid had an entry but ETS no longer has
+    # the row, the row was already removed by some other path (which
+    # means the corresponding leave was already notified). Skip the
+    # entry entirely rather than fabricating a {pid, nil} record and
+    # firing a wrong-meta notification.
+    for {group, tag} <- entries,
+        [{^group, ^pid, meta, ^tag}] <-
+          [:ets.match_object(scope, {group, pid, :_, tag})] do
+      :ets.match_delete(scope, {group, pid, :_, tag})
+      {group, pid, meta, tag}
     end
   end
 

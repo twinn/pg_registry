@@ -84,6 +84,55 @@ defmodule PgRegistry.PgTest do
     end
   end
 
+  describe "leave/3 edge cases" do
+    test "leave with empty pid list returns :ok", %{scope: scope} do
+      assert :ok = Pg.leave(scope, :g, [])
+    end
+  end
+
+  describe "down handler robustness" do
+    test "DOWN with a missing ETS row does not synthesize a fake notification",
+         %{scope: scope} do
+      {ref, _} = Pg.monitor_scope(scope)
+
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          Pg.join(scope, :ephemeral, self(), :real_meta)
+          send(parent, :joined)
+
+          receive do
+            :die -> :ok
+          end
+        end)
+
+      receive do
+        :joined -> :ok
+      end
+
+      assert_receive {^ref, :join, :ephemeral, [{^pid, :real_meta}]}
+
+      # Forcibly delete the ETS row from inside the GenServer so
+      # state.local still believes the pid has an entry.
+      :sys.replace_state(scope, fn state ->
+        :ets.match_delete(scope, {:ephemeral, pid, :_, :_})
+        state
+      end)
+
+      # Kill the process — DOWN handler runs, finds the entry in
+      # state.local, looks up ETS, gets [].
+      send(pid, :die)
+
+      # The buggy implementation synthesized {pid, nil} and notified.
+      # The fix should NOT notify at all when the row is gone.
+      refute_receive {^ref, :leave, :ephemeral, _}, 100
+
+      # And the scope must still be alive
+      assert Process.alive?(Process.whereis(scope))
+    end
+  end
+
   describe "leave/3" do
     test "removes a single pid", %{scope: scope} do
       :ok = Pg.join(scope, :g, self())
@@ -213,6 +262,32 @@ defmodule PgRegistry.PgTest do
     test "metadata is still attached on join", %{scope: scope} do
       :ok = Pg.join(scope, :singleton, self(), %{role: :primary})
       assert [{self(), %{role: :primary}}] == Pg.lookup(scope, :singleton)
+    end
+
+    test "registration is allowed when the recorded holder is already dead",
+         %{scope: scope} do
+      # Create a dead local pid
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+
+      receive do
+        {:DOWN, ^ref, _, _, _} -> :ok
+      end
+
+      refute Process.alive?(dead)
+
+      # Inject a stale row directly into ETS to simulate the
+      # "DOWN is in flight, hasn't been processed yet" race. Done from
+      # inside the GenServer via :sys.replace_state so we have ETS
+      # write permission as the table owner.
+      :sys.replace_state(scope, fn state ->
+        :ets.insert(scope, {:singleton, dead, :stale, :erlang.unique_integer([:monotonic])})
+        state
+      end)
+
+      # Without the dead-holder check, this would fail with
+      # {:error, {:already_registered, dead}}.
+      assert :ok = Pg.join(scope, :singleton, self())
     end
   end
 

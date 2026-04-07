@@ -16,7 +16,7 @@ without `:global`'s coordination tax.
 ```elixir
 def deps do
   [
-    {:pg_registry, "~> 0.2"}
+    {:pg_registry, "~> 0.3"}
   ]
 end
 ```

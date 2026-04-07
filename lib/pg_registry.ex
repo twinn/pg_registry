@@ -56,7 +56,7 @@ defmodule PgRegistry do
 
   @spec start_link(scope(), keyword()) :: GenServer.on_start()
   def start_link(scope, opts) when is_atom(scope) and is_list(opts) do
-    Pg.start_link(scope, opts)
+    Pg.start_link(scope, validate_pg_opts!(opts))
   end
 
   @doc """
@@ -80,22 +80,52 @@ defmodule PgRegistry do
   end
 
   # Splits Registry-shaped keyword opts into the scope name and the
-  # subset of options that PgRegistry.Pg understands. Validates :keys
-  # and :partitions; values that don't match what PgRegistry actually
-  # does raise loudly rather than silently degrading.
+  # subset of options that PgRegistry.Pg understands.
   defp parse_keyword_opts(opts) do
     scope = Keyword.fetch!(opts, :name)
+    pg_opts = opts |> Keyword.delete(:name) |> validate_pg_opts!()
+    {scope, pg_opts}
+  end
 
-    keys =
-      case Keyword.get(opts, :keys, :duplicate) do
-        mode when mode in [:duplicate, :unique] ->
-          mode
+  # Validates the option set passed to either form of start_link and
+  # returns the subset that PgRegistry.Pg.start_link/2 understands.
+  # All option-shape errors land here so the 2-arity and keyword
+  # paths give the same diagnostics.
+  @valid_pg_opts [:keys, :listeners, :partitions]
+  defp validate_pg_opts!(opts) do
+    validate_known_opts!(opts)
+    validate_partitions!(opts)
 
-        other ->
-          raise ArgumentError,
-                "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
-      end
+    [
+      keys: validate_keys!(opts),
+      listeners: validate_listeners!(opts)
+    ]
+  end
 
+  defp validate_known_opts!(opts) do
+    case Keyword.keys(opts) -- @valid_pg_opts do
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError,
+              "unknown PgRegistry option(s): #{inspect(unknown)}; " <>
+                "valid options are #{inspect(@valid_pg_opts ++ [:name])}"
+    end
+  end
+
+  defp validate_keys!(opts) do
+    case Keyword.get(opts, :keys, :duplicate) do
+      mode when mode in [:duplicate, :unique] ->
+        mode
+
+      other ->
+        raise ArgumentError,
+              "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_partitions!(opts) do
     case Keyword.get(opts, :partitions, 1) do
       1 ->
         :ok
@@ -115,13 +145,18 @@ defmodule PgRegistry do
       other ->
         raise ArgumentError, "expected :partitions to be 1, got: #{inspect(other)}"
     end
+  end
 
-    pg_opts =
-      opts
-      |> Keyword.take([:listeners])
-      |> Keyword.put(:keys, keys)
+  defp validate_listeners!(opts) do
+    listeners = Keyword.get(opts, :listeners, [])
 
-    {scope, pg_opts}
+    if is_list(listeners) and Enum.all?(listeners, &is_atom/1) do
+      listeners
+    else
+      raise ArgumentError,
+            "expected :listeners to be a list of atoms (registered process names), " <>
+              "got: #{inspect(listeners)}"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -157,8 +192,12 @@ defmodule PgRegistry do
 
   defp do_unregister(scope, key) do
     case Pg.get_local_members(scope, key) do
-      [] -> :ok
-      pids -> Pg.leave(scope, key, pids) && :ok
+      [] ->
+        :ok
+
+      pids ->
+        _ = Pg.leave(scope, key, pids)
+        :ok
     end
   end
 
@@ -272,6 +311,24 @@ defmodule PgRegistry do
   """
   @spec which_groups(scope()) :: [key()]
   defdelegate which_groups(scope), to: Pg
+
+  @doc """
+  Subscribes the caller to all join/leave/update events in `scope`.
+
+  Returns `{ref, snapshot}` where `snapshot` is `%{key => [{pid, value}]}`.
+  Subsequent events arrive as `{ref, :join | :leave | :update, key, payload}`.
+  See `PgRegistry.Pg.monitor_scope/1` for the payload shapes.
+  """
+  @spec monitor_scope(scope()) :: {reference(), %{key() => [{pid(), value()}]}}
+  defdelegate monitor_scope(scope), to: Pg
+
+  @doc "Subscribes the caller to events for a single `key`."
+  @spec monitor(scope(), key()) :: {reference(), [{pid(), value()}]}
+  defdelegate monitor(scope, key), to: Pg
+
+  @doc "Cancels a subscription created with `monitor_scope/1` or `monitor/2`."
+  @spec demonitor(scope(), reference()) :: :ok | false
+  defdelegate demonitor(scope, ref), to: Pg
 
   @doc """
   Invokes `callback` with the list of pids registered under `key` in
