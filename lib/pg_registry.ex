@@ -168,9 +168,15 @@ defmodule PgRegistry do
 
   Returns `:yes` on success, or `:no` if the scope was started with
   `keys: :unique` and another local pid already holds this key.
-  Implements the `:via` callback — `:no` causes
-  `GenServer.start_link(name: {:via, ...})` to surface
-  `{:error, {:already_started, pid}}` automatically.
+
+  Implements the `:via` callback. When called via
+  `GenServer.start_link(name: {:via, PgRegistry, ...})`, a `:no` reply
+  causes `gen.erl` to follow up with `whereis_name/1` and surface
+  `{:error, {:already_started, holder}}` automatically.
+
+  When you call `register_name/2` directly (not through `:via`), the
+  `:no` return does not carry the holder pid. Use `whereis_name/1` to
+  recover it if you need to know who the existing holder is.
   """
   @spec register_name(via_name(), pid()) :: :yes | :no
   def register_name({scope, key}, pid), do: do_register_name(scope, key, pid, nil)
@@ -204,6 +210,13 @@ defmodule PgRegistry do
   @doc """
   Looks up a single pid registered under `{scope, key}`. Local pids are
   preferred. Returns `:undefined` if no process is registered.
+
+  Accepts both the 2-tuple `{scope, key}` and the 3-tuple
+  `{scope, key, value}` via name shapes. The `value` field is **only**
+  used at registration time — it is ignored here, because lookup is by
+  key. Asymmetric on purpose: a caller usually doesn't know the value
+  to look up by it, and several pids may be registered under the same
+  key with different values.
   """
   @spec whereis_name(via_name()) :: pid() | :undefined
   def whereis_name({scope, key}), do: do_whereis(scope, key)
@@ -254,6 +267,14 @@ defmodule PgRegistry do
   @doc """
   Replaces the value attached to every entry under `key` in `scope`
   whose pid is `pid`. Returns `:not_joined` if `pid` has no entry there.
+
+  > #### Different from `Registry.update_value/3` {: .warning}
+  >
+  > If `pid` has been joined to `key` multiple times (because of repeated
+  > `register/3` or `register_name/2` calls), **all** of its entries are
+  > collapsed to `new_value`. `Registry.update_value/3` doesn't have to
+  > deal with this case because it's only available in `:unique` mode,
+  > where there's at most one entry per pid per key.
   """
   @spec update_value(scope(), key(), pid(), value()) :: :ok | :not_joined
   def update_value(scope, key, pid, new_value) when is_pid(pid) do
@@ -332,11 +353,23 @@ defmodule PgRegistry do
 
   @doc """
   Invokes `callback` with the list of pids registered under `key` in
-  `scope`, if there are any. The optional `_opts` is accepted for
-  Registry compatibility but currently ignored.
+  `scope`, if there are any.
+
+  Currently no options are supported. The fourth argument exists for
+  signature parity with `Registry.dispatch/4` but any non-empty option
+  list raises `ArgumentError` rather than silently doing the wrong
+  thing — in particular, `parallel: true` is not implemented; if you
+  need parallelism, spawn tasks from inside the callback yourself.
   """
   @spec dispatch(scope(), key(), ([pid()] -> term()), keyword()) :: :ok
-  def dispatch(scope, key, callback, _opts \\ []) when is_function(callback, 1) do
+  def dispatch(scope, key, callback, opts \\ []) when is_function(callback, 1) and is_list(opts) do
+    if opts != [] do
+      raise ArgumentError,
+            "PgRegistry.dispatch/4 does not currently support any options, " <>
+              "got: #{inspect(opts)}. Dispatch is always sequential; if you " <>
+              "need parallelism, spawn tasks from the callback yourself."
+    end
+
     case Pg.get_members(scope, key) do
       [] ->
         :ok
@@ -401,6 +434,10 @@ defmodule PgRegistry do
   @doc """
   Returns `{pid, value}` entries under `key` in `scope` whose value
   matches `pattern`. Mirrors `Registry.match/3`.
+
+  Only a single pattern + guard list is accepted. To run alternative
+  patterns over the same key, call `match/3` multiple times or use
+  `select/2` with a multi-clause match-spec.
   """
   @spec match(scope(), key(), term()) :: [{pid(), value()}]
   def match(scope, key, pattern), do: match(scope, key, pattern, [])

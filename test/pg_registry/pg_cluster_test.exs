@@ -157,6 +157,37 @@ defmodule PgRegistry.PgClusterTest do
     assert {:error, {:already_registered, _}} = Pg.join(scope, :singleton, self())
   end
 
+  test "remote pid leaving in unique mode releases the slot cluster-wide",
+       %{peer_node: peer_node} do
+    scope = :"pg_uniq_remote_#{:erlang.unique_integer([:positive])}"
+
+    {:ok, _} = Pg.start(scope, keys: :unique)
+    {:ok, _} = :erpc.call(peer_node, Pg, :start, [scope, [keys: :unique]])
+
+    remote_pid = spawn_remote_member(peer_node, scope, :singleton)
+    sync(scope, peer_node)
+    assert remote_pid in Pg.get_members(scope, :singleton)
+
+    # Subscribe before killing so we can wait deterministically for the
+    # local scope to observe and process the leave.
+    {ref, _} = Pg.monitor_scope(scope)
+
+    monitor_ref = Process.monitor(remote_pid)
+    :erpc.call(peer_node, :erlang, :exit, [remote_pid, :kill])
+
+    receive do
+      {:DOWN, ^monitor_ref, _, _, _} -> :ok
+    end
+
+    assert_receive {^ref, :leave, :singleton, [{^remote_pid, _}]}, 2000
+    refute remote_pid in Pg.get_members(scope, :singleton)
+
+    # The local node now sees an empty :singleton — but importantly, this
+    # has no bearing on local uniqueness, because per-node uniqueness only
+    # cares about LOCAL holders. We can register locally just fine.
+    assert :ok = Pg.join(scope, :singleton, self())
+  end
+
   test "remote update_meta is visible locally and notifies subscribers",
        %{scope: scope, peer_node: peer_node} do
     {ref, _} = Pg.monitor_scope(scope)

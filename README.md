@@ -49,13 +49,13 @@ PgRegistry.whereis_name({:my_registry, :my_key})
 | | `Registry` | `:global` | `PgRegistry` |
 |---|---|---|---|
 | Scope | one node | whole cluster | whole cluster |
-| Cost per register | µs | ms (cluster lock) | µs (async gossip) |
-| Convergence model | n/a | strong (synchronous) | eventual (gossip) |
-| Net-split behavior | n/a | collisions, killed on heal | diverges silently, converges on heal without conflict |
+| Cost per register | µs | ms (cluster-wide lock) | µs (async gossip per peer) |
+| Convergence model | n/a | synchronous, lock-based | eventual, gossip-based |
+| Net-split behavior | n/a | collisions on heal resolved by user-supplied resolver, may kill processes | diverges silently, converges on heal without conflict |
 | Per-process values | yes | no | yes |
 | Match-spec queries | yes (ETS-native) | no | yes (ETS-native) |
 | Listeners | yes | no | yes |
-| Unique key mode | yes (in-table) | yes (cluster-wide) | yes (per-node only) |
+| Unique key mode | yes (per-node) | yes (cluster-wide, expensive) | yes (per-node only) |
 
 `Registry` is fast but local-only. `:global` is cluster-wide but
 synchronous and famously slow. PgRegistry sits in a third spot:

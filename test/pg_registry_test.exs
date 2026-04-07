@@ -138,6 +138,21 @@ defmodule PgRegistryTest do
     end
   end
 
+  describe "dispatch/4 options" do
+    test "raises on unknown options", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :v)
+
+      assert_raise ArgumentError, ~r/dispatch/, fn ->
+        PgRegistry.dispatch(scope, :worker, fn _ -> :ok end, parallel: true)
+      end
+    end
+
+    test "accepts the default empty option list", %{scope: scope} do
+      PgRegistry.register(scope, :worker, :v)
+      assert :ok = PgRegistry.dispatch(scope, :worker, fn _ -> :ok end, [])
+    end
+  end
+
   describe "dispatch/3" do
     test "invokes callback for each member", %{scope: scope} do
       parent = self()

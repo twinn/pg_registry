@@ -53,12 +53,24 @@ defmodule PgRegistry.Pg do
 
   ## Options
 
-    * `:listeners` — a list of locally-registered process names that
-      will receive raw `{:register, scope, key, pid, value}` and
+    * `:listeners` — a list of process names that will receive raw
+      `{:register, scope, key, pid, value}` and
       `{:unregister, scope, key, pid}` messages whenever entries are
       added or removed. Matches Elixir's `Registry` listener semantics.
-      Listeners are local-only; they fire on this node for both
-      locally-originated and gossiped events.
+
+      Each listener must be a **locally-registered name** (atom). The
+      `{name, node()}` tuple form is *not* supported — listeners cannot
+      live on a remote node. Within those constraints, listeners fire
+      on this node for both locally-originated and gossiped-from-peer
+      events. If a listener atom is not currently bound to any process
+      (because the listener crashed, hasn't started yet, or was never
+      configured), the message is silently dropped — we never crash
+      the scope GenServer over a transiently-down listener.
+
+    * `:keys` — `:duplicate` (default) or `:unique`. Unique mode is
+      enforced **per-node only**; the cluster as a whole may still have
+      one holder per node under the same key. See the README's
+      "Per-node uniqueness" section for the rationale and use cases.
   """
   @spec start_link(scope(), keyword()) :: GenServer.on_start()
   def start_link(scope, opts) when is_atom(scope) and is_list(opts) do
@@ -96,11 +108,21 @@ defmodule PgRegistry.Pg do
   A pid may be joined to the same group multiple times with different
   metas; each entry is independent and must be left separately.
 
-  In a scope started with `keys: :unique`, joining a key that's
-  already held by another local pid (or even the same pid again)
-  returns `{:error, {:already_registered, pid}}`. Multi-pid joins
-  raise `ArgumentError` because they have no meaningful semantics in
-  unique mode.
+  ## Failure modes
+
+  In a scope started with `keys: :unique`:
+
+    * Single-pid join, key already held by a live local pid →
+      returns `{:error, {:already_registered, pid}}`. The holder pid
+      may briefly be stale across a remote process exit; the
+      registration retries cleanly once the local `:DOWN` is processed.
+    * Multi-pid join (list with more than one element) → **raises**
+      `ArgumentError`. There's no meaningful interpretation of "join
+      these N pids" when at most one of them can ever succeed. The
+      check runs at the API boundary so callers see a clean raise
+      rather than a `gen_server` exit.
+
+  In `:duplicate` mode (the default), this function only returns `:ok`.
   """
   @spec join(scope(), group(), pid() | [pid()], meta()) ::
           :ok | {:error, {:already_registered, pid()}}
@@ -188,13 +210,11 @@ defmodule PgRegistry.Pg do
 
   @spec which_groups(scope()) :: [group()]
   def which_groups(scope) when is_atom(scope) do
-    fn {g, _pid, _meta, _tag}, acc -> MapSet.put(acc, g) end
-    |> :ets.foldl(
-      MapSet.new(),
-      scope
-    )
-    |> MapSet.to_list()
+    set = :ets.foldl(&which_groups_collect/2, MapSet.new(), scope)
+    MapSet.to_list(set)
   end
+
+  defp which_groups_collect({g, _pid, _meta, _tag}, acc), do: MapSet.put(acc, g)
 
   @doc """
   Subscribes to all group changes in `scope`.
@@ -735,13 +755,16 @@ defmodule PgRegistry.Pg do
     end
   end
 
-  defp pop_first_group([], _group), do: {nil, []}
-  defp pop_first_group([{g, tag} | tail], g), do: {tag, tail}
+  # Tail-recursive — for a pid joined to many groups, popping one
+  # entry from the middle of the list is O(N) traversal with no stack
+  # growth and no body-recursive list rebuild.
+  defp pop_first_group(list, group), do: do_pop_first_group(list, group, [])
 
-  defp pop_first_group([head | tail], group) do
-    {tag, rest} = pop_first_group(tail, group)
-    {tag, [head | rest]}
-  end
+  defp do_pop_first_group([], _group, _acc), do: {nil, []}
+
+  defp do_pop_first_group([{g, tag} | tail], g, acc), do: {tag, Enum.reverse(acc, tail)}
+
+  defp do_pop_first_group([head | tail], group, acc), do: do_pop_first_group(tail, group, [head | acc])
 
   # Removes one specific (group, tag) entry from a pid's local list.
   # Used when we know exactly which entry we just deleted from ETS,
@@ -908,8 +931,23 @@ defmodule PgRegistry.Pg do
   end
 
   # Compute per-entry diff by (pid, tag). Removed entries are deleted
-  # from ETS; new entries are inserted. No notifications fire — see the
-  # design notes about sync ambiguity for multi-join metadata.
+  # from ETS; new entries are inserted.
+  #
+  # NOTE: This function deliberately does NOT fire :join/:leave/:update
+  # notifications, even though some entries may have changed. The reason
+  # is that sync only runs on (re)discovery — i.e. on `nodeup` after a
+  # netsplit or when a peer (re)connects — and the diff is ambiguous in
+  # the multi-join case. Two entries with the same pid in `old_entries`
+  # and two with the same pid in `new_entries` (potentially with
+  # different metas) cannot be unambiguously paired up without an
+  # entry-level identifier we don't currently expose on the wire. The
+  # state ends up correct in ETS; only the notification stream during
+  # convergence is incomplete. Subscribers reading the table after sync
+  # always see the right thing.
+  #
+  # If you ever change this to fire notifications, think carefully about
+  # the multi-join ambiguity first — see the README's "Convergence and
+  # net-splits" section.
   defp sync_one_group(scope, group, old_entries, new_entries) do
     new_set = MapSet.new(new_entries, fn {p, _m, t} -> {p, t} end)
     old_set = MapSet.new(old_entries, fn {p, _m, t} -> {p, t} end)
@@ -926,18 +964,16 @@ defmodule PgRegistry.Pg do
   # Walks the ETS table for every row whose pid is local. Returns
   # `[{group, [{pid, meta, tag}, ...]}, ...]` for the discovery handshake.
   defp all_local_entries(scope) do
-    fn {group, pid, meta, tag}, acc ->
-      if node(pid) == node() do
-        Map.update(acc, group, [{pid, meta, tag}], &[{pid, meta, tag} | &1])
-      else
-        acc
-      end
+    map = :ets.foldl(&collect_local_entry/2, %{}, scope)
+    Map.to_list(map)
+  end
+
+  defp collect_local_entry({group, pid, meta, tag}, acc) do
+    if node(pid) == node() do
+      Map.update(acc, group, [{pid, meta, tag}], &[{pid, meta, tag} | &1])
+    else
+      acc
     end
-    |> :ets.foldl(
-      %{},
-      scope
-    )
-    |> Map.to_list()
   end
 
   defp broadcast([], _msg), do: :ok

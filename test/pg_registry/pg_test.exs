@@ -88,6 +88,23 @@ defmodule PgRegistry.PgTest do
     test "leave with empty pid list returns :ok", %{scope: scope} do
       assert :ok = Pg.leave(scope, :g, [])
     end
+
+    test "leaving from a pid joined to many groups stays correct", %{scope: scope} do
+      # Exercises the pop_first_group path with a long state.local list
+      # to make sure tail-recursive rewriting preserves order/identity.
+      for i <- 1..30 do
+        :ok = Pg.join(scope, :"g_#{i}", self())
+      end
+
+      :ok = Pg.leave(scope, :g_15, self())
+
+      assert [] == Pg.get_members(scope, :g_15)
+
+      for i <- 1..30, i != 15 do
+        assert [self()] == Pg.get_members(scope, :"g_#{i}"),
+               "expected #{inspect(:"g_#{i}")} to still contain self()"
+      end
+    end
   end
 
   describe "down handler robustness" do
