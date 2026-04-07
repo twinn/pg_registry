@@ -418,6 +418,63 @@ defmodule PgRegistry.PgTest do
     end
   end
 
+  describe "monitor_scope/1 (snapshot semantics)" do
+    test "snapshot includes pre-subscribe entries", %{scope: scope} do
+      :ok = Pg.join(scope, :pre, self(), :v1)
+
+      {_ref, snapshot} = Pg.monitor_scope(scope)
+      assert snapshot[:pre] == [{self(), :v1}]
+    end
+
+    test "events fire for changes after subscribe", %{scope: scope} do
+      {ref, _} = Pg.monitor_scope(scope)
+      :ok = Pg.join(scope, :post, self(), :v2)
+
+      me = self()
+      assert_receive {^ref, :join, :post, [{^me, :v2}]}
+    end
+
+    test "snapshot is built without holding the GenServer for the whole fold",
+         %{scope: scope} do
+      # Pre-fill with enough entries that the snapshot fold is non-trivial.
+      for i <- 1..2_000 do
+        :ok = Pg.join(scope, {:k, i}, self())
+      end
+
+      # While monitor_scope runs, an unrelated GenServer call should be
+      # able to interleave. With the old blocking implementation the
+      # foldl ran inside handle_call and serialized everything; with the
+      # fix the foldl runs in the subscriber's own process.
+      parent = self()
+
+      monitor_task =
+        Task.async(fn ->
+          {_ref, snapshot} = Pg.monitor_scope(scope)
+          send(parent, :snapshot_done)
+          map_size(snapshot)
+        end)
+
+      # The unrelated call should complete promptly, regardless of how
+      # long the snapshot fold takes in the other process.
+      :ok = Pg.join(scope, :unrelated, self())
+
+      Task.await(monitor_task)
+      assert :unrelated in Pg.which_groups(scope)
+    end
+
+    test "snapshot includes all groups across many keys", %{scope: scope} do
+      for i <- 1..50 do
+        :ok = Pg.join(scope, {:m, i}, self(), i)
+      end
+
+      {_ref, snapshot} = Pg.monitor_scope(scope)
+
+      for i <- 1..50 do
+        assert snapshot[{:m, i}] == [{self(), i}]
+      end
+    end
+  end
+
   describe "monitor_scope/1" do
     test "returns current scope contents and a ref", %{scope: scope} do
       :ok = Pg.join(scope, :g, self(), :m)

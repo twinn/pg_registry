@@ -217,19 +217,67 @@ defmodule PgRegistry.Pg do
   defp which_groups_collect({g, _pid, _meta, _tag}, acc), do: MapSet.put(acc, g)
 
   @doc """
-  Subscribes to all group changes in `scope`.
+  Subscribes to all join/leave/update events in `scope` and returns a
+  snapshot of the current entries.
 
   Returns `{ref, snapshot}` where `snapshot` is `%{group => [{pid, meta}]}`.
-  Subsequent join/leave/update events are delivered as
-  `{ref, :join | :leave, group, [{pid, meta}, ...]}` and
-  `{ref, :update, group, [{pid, old_meta, new_meta}, ...]}`.
+  Subsequent events are delivered as:
+
+      {ref, :join,   group, [{pid, meta}, ...]}
+      {ref, :leave,  group, [{pid, meta}, ...]}
+      {ref, :update, group, [{pid, old_meta, new_meta}, ...]}
+
+  ## Snapshot semantics
+
+  The subscription is established atomically inside the scope GenServer
+  (a microsecond-scale operation), but **the snapshot itself is built
+  in the calling process** by reading ETS directly. This avoids
+  blocking the GenServer for the duration of the fold, which matters
+  for scopes with many entries.
+
+  Because the snapshot read happens after the subscription is in
+  place, it may overlap with concurrent join/leave/update activity:
+
+    * An entry added between subscribe and snapshot completion may
+      appear **both** in `snapshot` **and** as a `:join` event in the
+      subscriber's mailbox.
+    * An entry removed in the same window may appear in `snapshot`
+      and also as a `:leave` event.
+    * Metadata updates in the same window may similarly double-appear.
+
+  Consumers should treat the snapshot as a starting state and absorb
+  events idempotently — fold them into a `MapSet` or `Map` keyed by
+  `(group, pid)` rather than maintaining counters that assume
+  exactly-once delivery. The state always converges to the correct
+  view; only the transient overlap during subscription needs
+  tolerating.
   """
   @spec monitor_scope(scope()) :: {reference(), %{group() => [entry()]}}
-  def monitor_scope(scope), do: GenServer.call(scope, :monitor, :infinity)
+  def monitor_scope(scope) do
+    ref = GenServer.call(scope, :subscribe_scope, :infinity)
+    {ref, scope_snapshot(scope)}
+  end
 
-  @doc "Subscribes to changes in a single `group`."
+  @doc """
+  Subscribes to changes in a single `group` and returns a snapshot of
+  the current members.
+
+  Same snapshot semantics as `monitor_scope/1` — the snapshot is built
+  in the calling process from a single `:ets.lookup/2`, so the
+  GenServer isn't held for the duration. See `monitor_scope/1` for
+  the race notes.
+  """
   @spec monitor(scope(), group()) :: {reference(), [entry()]}
-  def monitor(scope, group), do: GenServer.call(scope, {:monitor, group}, :infinity)
+  def monitor(scope, group) do
+    ref = GenServer.call(scope, {:subscribe_group, group}, :infinity)
+    {ref, lookup(scope, group)}
+  end
+
+  defp scope_snapshot(scope) do
+    :ets.foldl(&snapshot_collect/2, %{}, scope)
+  end
+
+  defp snapshot_collect({g, p, m, _t}, acc), do: Map.update(acc, g, [{p, m}], &[{p, m} | &1])
 
   @spec demonitor(scope(), reference()) :: :ok | false
   def demonitor(scope, ref) when is_reference(ref) do
@@ -405,27 +453,21 @@ defmodule PgRegistry.Pg do
     end
   end
 
-  def handle_call(:monitor, {pid, _tag}, %State{} = s) do
-    contents =
-      :ets.foldl(
-        fn {g, p, m, _tag}, acc -> Map.update(acc, g, [{p, m}], &[{p, m} | &1]) end,
-        %{},
-        s.scope
-      )
-
+  # Subscribes the caller without computing a snapshot — the snapshot
+  # is built in the caller's own process, outside the GenServer, so we
+  # don't block all writes for the duration of an O(N) fold.
+  def handle_call(:subscribe_scope, {pid, _tag}, %State{} = s) do
     ref = Process.monitor(pid, tag: {:DOWN, :scope_monitors})
-    {:reply, {ref, contents}, %{s | scope_monitors: Map.put(s.scope_monitors, ref, pid)}}
+    {:reply, ref, %{s | scope_monitors: Map.put(s.scope_monitors, ref, pid)}}
   end
 
-  def handle_call({:monitor, group}, {pid, _tag}, %State{} = s) do
-    members = lookup(s.scope, group)
+  def handle_call({:subscribe_group, group}, {pid, _tag}, %State{} = s) do
     ref = Process.monitor(pid, tag: {:DOWN, :group_monitors})
 
     new_mg =
       Map.update(s.monitored_groups, group, [{pid, ref}], fn ex -> [{pid, ref} | ex] end)
 
-    {:reply, {ref, members},
-     %{s | group_monitors: Map.put(s.group_monitors, ref, {pid, group}), monitored_groups: new_mg}}
+    {:reply, ref, %{s | group_monitors: Map.put(s.group_monitors, ref, {pid, group}), monitored_groups: new_mg}}
   end
 
   def handle_call({:put_scope_meta, key, value}, _from, %State{scope: scope} = s) do
