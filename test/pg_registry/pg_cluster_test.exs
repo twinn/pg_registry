@@ -47,7 +47,10 @@ defmodule PgRegistry.PgClusterTest do
         [parent, scope, group, meta]
       ])
 
-    receive do: ({:joined, ^pid} -> :ok)
+    receive do
+      {:joined, ^pid} -> :ok
+    end
+
     pid
   end
 
@@ -79,7 +82,10 @@ defmodule PgRegistry.PgClusterTest do
 
     ref = Process.monitor(remote_pid)
     :erpc.call(peer_node, :erlang, :exit, [remote_pid, :kill])
-    receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
+
+    receive do
+      {:DOWN, ^ref, _, _, _} -> :ok
+    end
 
     sync(scope, peer_node)
     assert [] == Pg.get_members(scope, :ephemeral)

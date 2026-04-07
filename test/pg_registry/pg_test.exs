@@ -16,17 +16,26 @@ defmodule PgRegistry.PgTest do
       spawn(fn ->
         Pg.join(scope, group, self())
         send(parent, :joined)
-        receive do: (:stop -> :ok)
+
+        receive do
+          :stop -> :ok
+        end
       end)
 
-    receive do: (:joined -> :ok)
+    receive do
+      :joined -> :ok
+    end
+
     pid
   end
 
   defp stop(pid) do
     ref = Process.monitor(pid)
     send(pid, :stop)
-    receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
+
+    receive do
+      {:DOWN, ^ref, _, _, _} -> :ok
+    end
   end
 
   describe "start_link/1" do

@@ -12,6 +12,9 @@ defmodule PgRegistry.Pg.TestHelper do
   def member_loop(reply_to, scope, group, meta) do
     :ok = Pg.join(scope, group, self(), meta)
     send(reply_to, {:joined, self()})
-    receive do: (:stop -> :ok)
+
+    receive do
+      :stop -> :ok
+    end
   end
 end

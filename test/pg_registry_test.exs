@@ -173,7 +173,10 @@ defmodule PgRegistryTest do
       pid = spawn(fn -> :ok end)
       # Wait for process to die
       ref = Process.monitor(pid)
-      receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
+
+      receive do
+        {:DOWN, ^ref, _, _, _} -> :ok
+      end
 
       # pg won't have it since it died before/during join,
       # but let's register a living process, kill it, and verify cleanup
