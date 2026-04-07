@@ -87,16 +87,20 @@ defmodule PgRegistry.PgClusterTest do
   end
 
   test "remote scope crash removes its members locally", %{scope: scope, peer_node: peer_node} do
-    _remote_pid = spawn_remote_member(peer_node, scope, :workers)
+    remote_pid = spawn_remote_member(peer_node, scope, :workers)
     sync(scope, peer_node)
     assert length(Pg.get_members(scope, :workers)) == 1
 
-    remote_scope_pid = :erpc.call(peer_node, Process, :whereis, [scope])
-    ref = Process.monitor(remote_scope_pid)
-    :erpc.call(peer_node, Process, :exit, [remote_scope_pid, :kill])
-    receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
+    # Subscribe BEFORE killing — the leave notification is fired from
+    # inside the local scope's DOWN handler, so receiving it proves the
+    # ETS row has already been removed. Polling :sys.get_state races
+    # against the in-flight DOWN delivery from the peer node.
+    {ref, _} = Pg.monitor_scope(scope)
 
-    _ = :sys.get_state(scope)
+    remote_scope_pid = :erpc.call(peer_node, Process, :whereis, [scope])
+    :erpc.call(peer_node, Process, :exit, [remote_scope_pid, :kill])
+
+    assert_receive {^ref, :leave, :workers, [{^remote_pid, _}]}, 2000
     assert [] == Pg.get_members(scope, :workers)
   end
 
