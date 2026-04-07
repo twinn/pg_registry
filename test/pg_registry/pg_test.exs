@@ -367,6 +367,27 @@ defmodule PgRegistry.PgTest do
     end
   end
 
+  describe "wire protocol version handshake" do
+    test "discover with mismatched protocol version is rejected", %{scope: scope} do
+      send(scope, {:discover, self(), 99_999})
+
+      # Round-trip through the GenServer to ensure the message has been processed
+      state = :sys.get_state(scope)
+
+      assert Process.alive?(Process.whereis(scope))
+      refute Map.has_key?(state.remote, self())
+    end
+
+    test "discover with no protocol version (legacy 2-arity) is rejected", %{scope: scope} do
+      send(scope, {:discover, self()})
+
+      state = :sys.get_state(scope)
+
+      assert Process.alive?(Process.whereis(scope))
+      refute Map.has_key?(state.remote, self())
+    end
+  end
+
   describe "demonitor/2" do
     test "stops further notifications and flushes pending ones", %{scope: scope} do
       {ref, _} = Pg.monitor_scope(scope)

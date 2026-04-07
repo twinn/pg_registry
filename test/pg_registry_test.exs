@@ -517,6 +517,15 @@ defmodule PgRegistryTest do
       spec = [{{:a, :_, :_}, [], [true]}]
       assert 2 == PgRegistry.count_select(scope, spec)
     end
+
+    test "respects the user's body — body returning false counts as 0", %{scope: scope} do
+      PgRegistry.register(scope, :a, 1)
+      PgRegistry.register(scope, :a, 2)
+
+      # Body returns false unconditionally — must NOT count any matches
+      spec = [{{:a, :_, :_}, [], [false]}]
+      assert 0 == PgRegistry.count_select(scope, spec)
+    end
   end
 
   describe "unregister_match/3" do
@@ -526,6 +535,25 @@ defmodule PgRegistryTest do
 
       :ok = PgRegistry.unregister_match(scope, :worker, %{role: :replica})
       assert [{self(), %{role: :primary}}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "removes the matched entry, not the most-recently-joined one", %{scope: scope} do
+      # Critical: join :a first, then :b. The LIFO head is :b.
+      # If we ask to remove :a, we should remove :a — not :b.
+      PgRegistry.register(scope, :worker, :a)
+      PgRegistry.register(scope, :worker, :b)
+
+      :ok = PgRegistry.unregister_match(scope, :worker, :a)
+      assert [{self(), :b}] == PgRegistry.lookup(scope, :worker)
+    end
+
+    test "removes all matching entries when several match", %{scope: scope} do
+      PgRegistry.register(scope, :worker, %{role: :replica, n: 1})
+      PgRegistry.register(scope, :worker, %{role: :replica, n: 2})
+      PgRegistry.register(scope, :worker, %{role: :primary, n: 3})
+
+      :ok = PgRegistry.unregister_match(scope, :worker, %{role: :replica, n: :_})
+      assert [{self(), %{role: :primary, n: 3}}] == PgRegistry.lookup(scope, :worker)
     end
 
     test "leaves other pids' entries alone", %{scope: scope} do
@@ -650,6 +678,46 @@ defmodule PgRegistryTest do
       Task.shutdown(task, :brutal_kill)
       assert_receive {:unregister, ^scope, :worker, ^pid}
     end
+
+    test "missing listener atom does not crash the scope" do
+      missing = :"pg_listener_missing_#{:erlang.unique_integer([:positive])}"
+      # listener atom is intentionally NOT registered to any process
+      assert Process.whereis(missing) == nil
+
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [missing]}})
+
+      scope_pid = Process.whereis(scope)
+      assert is_pid(scope_pid)
+
+      # This must not crash the scope
+      {:ok, _} = PgRegistry.register(scope, :worker, :v1)
+      :ok = PgRegistry.unregister(scope, :worker)
+
+      assert Process.alive?(scope_pid)
+      assert Process.whereis(scope) == scope_pid
+    end
+
+    test "listener that crashes between events still allows the scope to keep going" do
+      name = :"pg_listener_flaky_#{:erlang.unique_integer([:positive])}"
+
+      # Spawn a process registered under `name`, then kill it. The atom
+      # is now unbound — the next register should be a no-op for the
+      # listener and must not crash the scope.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      Process.register(pid, name)
+      Process.exit(pid, :kill)
+      # Wait for unregister
+      Process.sleep(20)
+      assert Process.whereis(name) == nil
+
+      scope = :"pg_lst_#{:erlang.unique_integer([:positive])}"
+      start_supervised!({PgRegistry, {scope, listeners: [name]}})
+      scope_pid = Process.whereis(scope)
+
+      {:ok, _} = PgRegistry.register(scope, :worker, :v)
+      assert Process.alive?(scope_pid)
+    end
   end
 
   describe "meta/2, put_meta/3, delete_meta/2" do
@@ -674,6 +742,14 @@ defmodule PgRegistryTest do
       # same pid registered twice under same key counts as two
       PgRegistry.register_name({scope, :a}, self())
       assert 3 == PgRegistry.count(scope)
+    end
+
+    test "is correct across many keys", %{scope: scope} do
+      for i <- 1..50 do
+        PgRegistry.register_name({scope, {:k, i}}, self())
+      end
+
+      assert 50 == PgRegistry.count(scope)
     end
   end
 end

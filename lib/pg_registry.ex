@@ -248,12 +248,16 @@ defmodule PgRegistry do
   @doc """
   Returns the total number of `{pid, value}` entries in `scope`,
   counting duplicates. Same semantics as Elixir's `Registry.count/1`.
+
+  Implemented as a single `:ets.info/2` call — O(1) regardless of
+  scope size.
   """
   @spec count(scope()) :: non_neg_integer()
   def count(scope) do
-    scope
-    |> Pg.which_groups()
-    |> Enum.reduce(0, fn key, acc -> acc + length(Pg.lookup(scope, key)) end)
+    case :ets.info(scope, :size) do
+      :undefined -> 0
+      n -> n
+    end
   end
 
   @doc """
@@ -378,15 +382,17 @@ defmodule PgRegistry do
     :ets.select(scope, rewrite_user_spec(match_spec))
   end
 
-  @doc "Like `select/2` but returns the count instead of the results."
+  @doc """
+  Like `select/2` but returns the count of entries whose match-spec
+  body returns `true`.
+
+  The user's match-spec body is preserved (matching `Registry.count_select/2`),
+  so a body of `[false]` correctly counts zero, and a body that branches
+  on the value can be used as a filter.
+  """
   @spec count_select(scope(), :ets.match_spec()) :: non_neg_integer()
   def count_select(scope, match_spec) when is_list(match_spec) do
-    spec =
-      Enum.map(rewrite_user_spec(match_spec), fn {match, guards, _body} ->
-        {match, guards, [true]}
-      end)
-
-    :ets.select_count(scope, spec)
+    :ets.select_count(scope, rewrite_user_spec(match_spec))
   end
 
   @doc """
@@ -399,15 +405,7 @@ defmodule PgRegistry do
   @doc "Like `unregister_match/3` with guards."
   @spec unregister_match(scope(), key(), term(), list()) :: :ok
   def unregister_match(scope, key, pattern, guards) do
-    me = self()
-
-    pids =
-      for {pid, _v} <- match(scope, key, pattern, guards), pid == me, do: pid
-
-    if pids != [] do
-      Pg.leave(scope, key, pids)
-    end
-
+    _ = Pg.unregister_match(scope, key, self(), pattern, guards)
     :ok
   end
 

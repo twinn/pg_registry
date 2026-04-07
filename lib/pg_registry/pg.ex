@@ -25,10 +25,21 @@ defmodule PgRegistry.Pg do
 
   use GenServer
 
+  require Logger
+
   @type scope :: atom()
   @type group :: term()
   @type meta :: term()
   @type entry :: {pid(), meta()}
+
+  # Wire-protocol version. Bump this on any breaking change to the
+  # discover/sync/join/leave/update_meta message shapes. Peers running
+  # different versions refuse to peer rather than corrupting state.
+  #
+  # History:
+  #   1 — initial PgRegistry.Pg protocol with {key, pid, meta, tag}
+  #       wire entries and {group, pid, tag} leave triples.
+  @protocol_version 1
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -125,6 +136,22 @@ defmodule PgRegistry.Pg do
   def update_meta(scope, group, pid, new_meta) when is_pid(pid) do
     :ok = ensure_local(pid)
     GenServer.call(scope, {:update_meta, group, pid, new_meta}, :infinity)
+  end
+
+  @doc """
+  Removes every entry in `group` belonging to local `pid` whose meta
+  matches `value_pattern` (with optional `guards`).
+
+  This is the primitive backing `PgRegistry.unregister_match/3,4`. It
+  runs the match-spec atomically inside the scope GenServer and
+  removes entries by their internal tag, so the right entries are
+  deleted regardless of join order. Returns the number of entries
+  removed.
+  """
+  @spec unregister_match(scope(), group(), pid(), term(), list()) :: non_neg_integer()
+  def unregister_match(scope, group, pid, value_pattern, guards \\ []) when is_pid(pid) do
+    :ok = ensure_local(pid)
+    GenServer.call(scope, {:unregister_match, group, pid, value_pattern, guards}, :infinity)
   end
 
   @spec get_members(scope(), group()) :: [pid()]
@@ -258,7 +285,7 @@ defmodule PgRegistry.Pg do
     :ok = :net_kernel.monitor_nodes(true)
 
     for node <- Node.list() do
-      send({scope, node}, {:discover, self()})
+      send({scope, node}, {:discover, self(), @protocol_version})
     end
 
     ^scope =
@@ -311,6 +338,36 @@ defmodule PgRegistry.Pg do
 
       broadcast_leaves(s.remote, group, removed)
       {:reply, :ok, %{s | local: new_local}}
+    end
+  end
+
+  def handle_call({:unregister_match, group, pid, value_pattern, guards}, _from, %State{} = s) do
+    spec = [{{group, pid, value_pattern, :"$1"}, guards, [{{:"$_", :"$1"}}]}]
+
+    case :ets.select(s.scope, spec) do
+      [] ->
+        {:reply, 0, s}
+
+      matches ->
+        # matches :: [{full_row, tag}]
+        pub = for {{^group, ^pid, meta, _t}, _tag} <- matches, do: {pid, meta}
+
+        for {row, _tag} <- matches do
+          :ets.delete_object(s.scope, row)
+        end
+
+        new_local =
+          Enum.reduce(matches, s.local, fn {_row, tag}, acc ->
+            remove_entry_from_local(acc, pid, group, tag)
+          end)
+
+        notify_group(s.scope_monitors, s.monitored_groups, :leave, group, pub)
+        notify_listeners(s.listeners, s.scope, :unregister, group, pub)
+
+        leave_triples = for {_row, tag} <- matches, do: {group, pid, tag}
+        broadcast(Map.keys(s.remote), {:leave, self(), leave_triples})
+
+        {:reply, length(matches), %{s | local: new_local}}
     end
   end
 
@@ -441,8 +498,27 @@ defmodule PgRegistry.Pg do
     end
   end
 
-  def handle_info({:discover, peer}, %State{} = s), do: handle_discover(peer, s)
-  def handle_info({:discover, peer, _proto_version}, %State{} = s), do: handle_discover(peer, s)
+  # Legacy 2-arity discover (no version) — pre-version-handshake peer.
+  # Refuse to peer rather than risking wire-format mismatch.
+  def handle_info({:discover, peer}, %State{} = s) do
+    Logger.warning(
+      "PgRegistry.Pg(#{inspect(s.scope)}): rejecting discover from #{inspect(peer)} " <>
+        "(peer did not advertise a protocol version; ours is #{@protocol_version})"
+    )
+
+    {:noreply, s}
+  end
+
+  def handle_info({:discover, peer, @protocol_version}, %State{} = s), do: handle_discover(peer, s)
+
+  def handle_info({:discover, peer, version}, %State{} = s) do
+    Logger.warning(
+      "PgRegistry.Pg(#{inspect(s.scope)}): rejecting discover from #{inspect(peer)} " <>
+        "(peer protocol version #{inspect(version)} does not match ours #{@protocol_version})"
+    )
+
+    {:noreply, s}
+  end
 
   # Local process exit
   def handle_info({:DOWN, mref, :process, pid, _info}, %State{} = s) when node(pid) == node() do
@@ -507,7 +583,7 @@ defmodule PgRegistry.Pg do
   def handle_info({:nodeup, node}, %State{} = s) when node == node(), do: {:noreply, s}
 
   def handle_info({:nodeup, node}, %State{scope: scope} = s) do
-    send({scope, node}, {:discover, self()})
+    send({scope, node}, {:discover, self(), @protocol_version})
     {:noreply, s}
   end
 
@@ -538,7 +614,7 @@ defmodule PgRegistry.Pg do
       {:noreply, s}
     else
       mref = Process.monitor(peer)
-      send(peer, {:discover, self()})
+      send(peer, {:discover, self(), @protocol_version})
       {:noreply, %{s | remote: Map.put(remote, peer, {mref, %{}})}}
     end
   end
@@ -657,6 +733,30 @@ defmodule PgRegistry.Pg do
   defp pop_first_group([head | tail], group) do
     {tag, rest} = pop_first_group(tail, group)
     {tag, [head | rest]}
+  end
+
+  # Removes one specific (group, tag) entry from a pid's local list.
+  # Used when we know exactly which entry we just deleted from ETS,
+  # so we don't have to rely on LIFO order. Demonitors and removes
+  # the pid entirely if its list becomes empty.
+  defp remove_entry_from_local(local, pid, group, tag) do
+    case Map.get(local, pid) do
+      nil ->
+        local
+
+      {mref, list} ->
+        case List.delete(list, {group, tag}) do
+          ^list ->
+            local
+
+          [] ->
+            Process.demonitor(mref, [:flush])
+            Map.delete(local, pid)
+
+          new_list ->
+            Map.put(local, pid, {mref, new_list})
+        end
+    end
   end
 
   # --- ETS row mutation ---
@@ -852,11 +952,17 @@ defmodule PgRegistry.Pg do
   # `verb` is `:register` or `:unregister`. For `:register`, `entries`
   # are `[{pid, meta}]` pairs (we synthesize one message per pid). For
   # `:unregister`, `entries` are `[{pid, _}]` and we drop the meta.
+  #
+  # Listeners are addressed by registered name (atom). If the name
+  # isn't currently bound to any process — because the listener never
+  # started, crashed, or hasn't restarted yet — we silently drop the
+  # delivery. We must NOT crash the scope GenServer over a misconfigured
+  # or transiently-down listener.
   defp notify_listeners([], _scope, _verb, _group, _entries), do: :ok
 
   defp notify_listeners(listeners, scope, :register, group, entries) do
     for listener <- listeners, {pid, meta} <- entries do
-      send(listener, {:register, scope, group, pid, meta})
+      deliver_listener(listener, {:register, scope, group, pid, meta})
     end
 
     :ok
@@ -864,10 +970,17 @@ defmodule PgRegistry.Pg do
 
   defp notify_listeners(listeners, scope, :unregister, group, entries) do
     for listener <- listeners, {pid, _meta} <- entries do
-      send(listener, {:unregister, scope, group, pid})
+      deliver_listener(listener, {:unregister, scope, group, pid})
     end
 
     :ok
+  end
+
+  defp deliver_listener(name, msg) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> Kernel.send(pid, msg)
+    end
   end
 
   defp notify_group(scope_monitors, mg, action, group, payload) do
