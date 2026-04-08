@@ -232,8 +232,16 @@ defmodule PgRegistry do
   > `:duplicate`-keyed scope, and the start will succeed. But
   > subsequent `GenServer.call`, `GenServer.cast`, and `Process.whereis`
   > on the via tuple will raise, because they call `whereis_name/1`
-  > which requires unique mode. Use `lookup/2` or `get_members/2` to
-  > enumerate pids instead.
+  > which requires unique mode. Use `lookup/2` or `lookup_local/2`
+  > to enumerate pids instead.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(name: :doc_register_name, keys: :unique)
+      iex> PgRegistry.register_name({:doc_register_name, :singleton}, self())
+      :yes
+      iex> PgRegistry.register_name({:doc_register_name, :singleton}, self())
+      :no
   """
   @spec register_name(via_name(), pid()) :: :yes | :no
   def register_name({scope, key}, pid), do: do_register_name(scope, key, pid, nil)
@@ -299,6 +307,16 @@ defmodule PgRegistry do
   Both `{scope, key}` and `{scope, key, value}` via name shapes are
   accepted; the `value` field is only used at registration time and
   is ignored by lookup.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(name: :doc_whereis, keys: :unique)
+      iex> PgRegistry.whereis_name({:doc_whereis, :singleton})
+      :undefined
+      iex> PgRegistry.register_name({:doc_whereis, :singleton}, self())
+      :yes
+      iex> PgRegistry.whereis_name({:doc_whereis, :singleton}) == self()
+      true
   """
   @spec whereis_name(via_name()) :: pid() | :undefined
   def whereis_name({scope, key}) do
@@ -354,6 +372,18 @@ defmodule PgRegistry do
 
   This is the metadata-aware view. Equivalent to Elixir's `Registry.lookup/2`
   but spans the cluster.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_lookup)
+      iex> {:ok, _} = PgRegistry.register(:doc_lookup, :worker, %{role: :primary})
+      iex> [{pid, %{role: :primary}}] = PgRegistry.lookup(:doc_lookup, :worker)
+      iex> pid == self()
+      true
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_lookup_empty)
+      iex> PgRegistry.lookup(:doc_lookup_empty, :nobody)
+      []
   """
   @spec lookup(scope(), key()) :: [{pid(), value()}]
   def lookup(scope, key), do: Pg.lookup(scope, key)
@@ -379,6 +409,16 @@ defmodule PgRegistry do
   Sugar for `update_value/4` that updates the calling process's entry.
   Closer in shape to `Registry.update_value/3` but takes a literal value
   rather than a callback.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_update_value)
+      iex> PgRegistry.register(:doc_update_value, :worker, :v1)
+      iex> PgRegistry.update_value(:doc_update_value, :worker, :v2)
+      :ok
+      iex> [{_pid, :v2}] = PgRegistry.lookup(:doc_update_value, :worker)
+      iex> PgRegistry.update_value(:doc_update_value, :nobody, :v)
+      :not_joined
   """
   @spec update_value(scope(), key(), value()) :: :ok | :not_joined
   def update_value(scope, key, new_value) do
@@ -390,6 +430,14 @@ defmodule PgRegistry do
 
   Walks every group in the scope, so cost is `O(number_of_keys)`. A pid
   joined to the same key multiple times appears only once in the result.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_keys)
+      iex> PgRegistry.register(:doc_keys, :a, :v)
+      iex> PgRegistry.register(:doc_keys, :b, :v)
+      iex> PgRegistry.keys(:doc_keys, self()) |> Enum.sort()
+      [:a, :b]
   """
   @spec keys(scope(), pid()) :: [key()]
   def keys(scope, pid) when is_pid(pid) do
@@ -405,6 +453,16 @@ defmodule PgRegistry do
 
   Implemented as a single `:ets.info/2` call — O(1) regardless of
   scope size.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_count)
+      iex> PgRegistry.count(:doc_count)
+      0
+      iex> PgRegistry.register(:doc_count, :a, 1)
+      iex> PgRegistry.register(:doc_count, :b, 2)
+      iex> PgRegistry.count(:doc_count)
+      2
   """
   @spec count(scope()) :: non_neg_integer()
   def count(scope) do
@@ -490,6 +548,25 @@ defmodule PgRegistry do
   Returns `{:ok, self()}` on success. In a scope started with
   `keys: :unique`, returns `{:error, {:already_registered, pid}}`
   if another local pid already holds the key.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_register)
+      iex> {:ok, pid} = PgRegistry.register(:doc_register, :worker, %{role: :primary})
+      iex> pid == self()
+      true
+      iex> [{_pid, %{role: :primary}}] = PgRegistry.lookup(:doc_register, :worker)
+      iex> :ok
+
+  In `:unique` mode, a second `register/3` on the same key returns
+  an error tuple with the current holder:
+
+      iex> {:ok, _} = PgRegistry.start_link(name: :doc_register_unique, keys: :unique)
+      iex> {:ok, _} = PgRegistry.register(:doc_register_unique, :singleton, :v)
+      iex> {:error, {:already_registered, holder}} =
+      ...>   PgRegistry.register(:doc_register_unique, :singleton, :v)
+      iex> holder == self()
+      true
   """
   @spec register(scope(), key(), value()) ::
           {:ok, pid()} | {:error, {:already_registered, pid()}}
@@ -503,6 +580,17 @@ defmodule PgRegistry do
   @doc """
   Unregisters the calling process from `key` in `scope`. Returns `:ok`
   whether or not the caller had a registration.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_unregister)
+      iex> PgRegistry.register(:doc_unregister, :worker, :v)
+      iex> PgRegistry.unregister(:doc_unregister, :worker)
+      :ok
+      iex> PgRegistry.lookup(:doc_unregister, :worker)
+      []
+      iex> PgRegistry.unregister(:doc_unregister, :nobody)
+      :ok
   """
   @spec unregister(scope(), key()) :: :ok
   def unregister(scope, key) do
@@ -515,6 +603,15 @@ defmodule PgRegistry do
   @doc """
   Returns the values registered by `pid` under `key` in `scope`.
   Mirrors `Registry.values/3`.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_values)
+      iex> PgRegistry.register(:doc_values, :worker, :v1)
+      iex> PgRegistry.values(:doc_values, :worker, self())
+      [:v1]
+      iex> PgRegistry.values(:doc_values, :worker, spawn(fn -> :ok end))
+      []
   """
   @spec values(scope(), key(), pid()) :: [value()]
   def values(scope, key, pid) when is_pid(pid) do
@@ -538,6 +635,15 @@ defmodule PgRegistry do
   Only a single pattern + guard list is accepted. To run alternative
   patterns over the same key, call `match/3` multiple times or use
   `select/2` with a multi-clause match-spec.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_match)
+      iex> PgRegistry.register(:doc_match, :worker, %{role: :primary})
+      iex> PgRegistry.register(:doc_match, :worker, %{role: :replica})
+      iex> matches = PgRegistry.match(:doc_match, :worker, %{role: :primary})
+      iex> Enum.map(matches, fn {_pid, v} -> v end)
+      [%{role: :primary}]
   """
   @spec match(scope(), key(), term()) :: [{pid(), value()}]
   def match(scope, key, pattern), do: match(scope, key, pattern, [])
@@ -631,6 +737,20 @@ defmodule PgRegistry do
   @doc """
   Returns `{:ok, value}` if `key` is set in `scope`'s metadata, else
   `:error`. Local-only — metadata is not gossiped between nodes.
+
+  ## Examples
+
+      iex> {:ok, _} = PgRegistry.start_link(:doc_meta)
+      iex> PgRegistry.meta(:doc_meta, :config)
+      :error
+      iex> PgRegistry.put_meta(:doc_meta, :config, %{retries: 3})
+      :ok
+      iex> PgRegistry.meta(:doc_meta, :config)
+      {:ok, %{retries: 3}}
+      iex> PgRegistry.delete_meta(:doc_meta, :config)
+      :ok
+      iex> PgRegistry.meta(:doc_meta, :config)
+      :error
   """
   @spec meta(scope(), term()) :: {:ok, term()} | :error
   defdelegate meta(scope, key), to: Pg, as: :get_scope_meta

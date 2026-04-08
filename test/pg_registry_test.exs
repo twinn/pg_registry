@@ -3,6 +3,8 @@ defmodule PgRegistryTest do
 
   alias PgRegistry.Pg
 
+  doctest PgRegistry
+
   setup do
     scope = :"test_#{:erlang.unique_integer([:positive])}"
     start_supervised!({PgRegistry, scope})
