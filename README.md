@@ -290,8 +290,9 @@ One known imperfection: on netsplit recovery, sync-driven membership
 changes update ETS correctly but do *not* fire `:update`
 notifications for entries whose metadata changed during the split.
 Subscribers see correct state at every read; only the notification
-stream during convergence is incomplete. See the source of
-`PgRegistry.Pg.sync_one_group/4` for context.
+stream during convergence is incomplete. See the comment on the
+private `sync_one_group/4` in `lib/pg_registry/pg.ex` for the
+rationale (multi-join ambiguity makes the diff non-unique).
 
 ### Storage layout
 

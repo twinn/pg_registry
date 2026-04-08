@@ -38,7 +38,9 @@ defmodule PgRegistry.MixProject do
   end
 
   defp description do
-    "A distributed process registry backed by Erlang's :pg module. Works like Elixir's Registry but discovers processes across clusters."
+    "A distributed, metadata-aware process registry for Elixir. " <>
+      "Cluster-aware like :pg, Registry-shaped API, per-process values, " <>
+      "listener notifications, and native ETS match-spec queries."
   end
 
   defp package do
