@@ -415,11 +415,17 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Returns all pids registered under `key` in `scope` (cluster-wide).
-  Bare-pid view; use `lookup/2` for `{pid, value}` entries.
+  Returns only the `{pid, value}` entries under `key` whose pid lives
+  on the current node.
+
+  This has no direct analog in Elixir's `Registry` — it's a
+  distributed-registry concern. Use it when you want to operate on
+  just "this node's contribution to the cluster state": draining a
+  node before shutdown, per-node metrics, preferring a local
+  instance, etc. For the cluster-wide view use `lookup/2`.
   """
-  @spec get_members(scope(), key()) :: [pid()]
-  defdelegate get_members(scope, key), to: Pg
+  @spec lookup_local(scope(), key()) :: [{pid(), value()}]
+  defdelegate lookup_local(scope, key), to: Pg
 
   @doc """
   Returns all keys with at least one registered process in `scope`.

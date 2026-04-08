@@ -27,14 +27,14 @@ defmodule PgRegistryTest do
   describe "register_name/2 (via callback, works in both modes)" do
     test "registers a pid in :duplicate mode", %{scope: dup} do
       assert :yes = PgRegistry.register_name({dup, :my_key}, self())
-      assert self() in PgRegistry.get_members(dup, :my_key)
+      assert [{self(), nil}] == PgRegistry.lookup(dup, :my_key)
     end
 
     test "a second registration in :duplicate mode also returns :yes", %{scope: dup} do
       assert :yes = PgRegistry.register_name({dup, :my_key}, self())
       # Same pid under same key again — duplicates allowed
       assert :yes = PgRegistry.register_name({dup, :my_key}, self())
-      assert length(PgRegistry.get_members(dup, :my_key)) == 2
+      assert length(PgRegistry.lookup(dup, :my_key)) == 2
     end
 
     test "registers a pid in :unique mode" do
@@ -80,10 +80,10 @@ defmodule PgRegistryTest do
   describe "unregister_name/1 (via callback, works in both modes)" do
     test "removes local entries under key in :duplicate mode", %{scope: dup} do
       PgRegistry.register_name({dup, :my_key}, self())
-      assert self() in PgRegistry.get_members(dup, :my_key)
+      assert [{self(), nil}] == PgRegistry.lookup(dup, :my_key)
 
       assert :ok = PgRegistry.unregister_name({dup, :my_key})
-      refute self() in PgRegistry.get_members(dup, :my_key)
+      assert [] == PgRegistry.lookup(dup, :my_key)
     end
 
     test "removes the holder in :unique mode" do
@@ -122,7 +122,7 @@ defmodule PgRegistryTest do
     end
   end
 
-  describe "multi-pid join in :duplicate mode (Pg.join, not via callback)" do
+  describe "multi-pid join in :duplicate mode" do
     test "allows multiple processes to register under the same key", %{scope: scope} do
       task =
         Task.async(fn ->
@@ -133,14 +133,14 @@ defmodule PgRegistryTest do
       Process.sleep(50)
 
       :ok = Pg.join(scope, :my_key, self())
-      assert length(PgRegistry.get_members(scope, :my_key)) == 2
+      assert length(PgRegistry.lookup(scope, :my_key)) == 2
 
       Task.shutdown(task, :brutal_kill)
     end
   end
 
-  describe "get_members/2" do
-    test "returns all processes registered under a key", %{scope: scope} do
+  describe "lookup/2 returns all entries under a key" do
+    test "includes every registered pid, across all callers", %{scope: scope} do
       task1 =
         Task.async(fn ->
           PgRegistry.register_name({scope, :group}, self())
@@ -155,17 +155,29 @@ defmodule PgRegistryTest do
 
       Process.sleep(50)
 
-      members = PgRegistry.get_members(scope, :group)
-      assert length(members) == 2
-      assert task1.pid in members
-      assert task2.pid in members
+      entries = PgRegistry.lookup(scope, :group)
+      assert length(entries) == 2
+      pids = for {pid, _} <- entries, do: pid
+      assert task1.pid in pids
+      assert task2.pid in pids
 
       Task.shutdown(task1, :brutal_kill)
       Task.shutdown(task2, :brutal_kill)
     end
 
     test "returns empty list for unknown key", %{scope: scope} do
-      assert [] == PgRegistry.get_members(scope, :no_such_key)
+      assert [] == PgRegistry.lookup(scope, :no_such_key)
+    end
+  end
+
+  describe "lookup_local/2" do
+    test "returns the same entries as lookup/2 on a single node", %{scope: scope} do
+      PgRegistry.register_name({scope, :worker, :v1}, self())
+      assert PgRegistry.lookup(scope, :worker) == PgRegistry.lookup_local(scope, :worker)
+    end
+
+    test "returns [] for unknown key", %{scope: scope} do
+      assert [] == PgRegistry.lookup_local(scope, :nope)
     end
   end
 
@@ -217,9 +229,8 @@ defmodule PgRegistryTest do
         for pid <- members, do: send(pid, :work)
       end)
 
-      # Verify all 3 received the message via get_members
-      members = PgRegistry.get_members(scope, :workers)
-      assert length(members) == 3
+      # Verify all 3 are registered via lookup
+      assert length(PgRegistry.lookup(scope, :workers)) == 3
     end
 
     test "does not invoke callback when no members", %{scope: scope} do

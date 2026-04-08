@@ -100,6 +100,12 @@ Supported options:
 
 # via the Registry-shaped API (registers self())
 PgRegistry.register(scope, key, value)          #=> {:ok, self()}
+PgRegistry.unregister(scope, key)               #=> :ok
+
+# via the explicit-pid API
+PgRegistry.register_name({scope, key}, pid)
+PgRegistry.register_name({scope, key, value}, pid)
+PgRegistry.unregister_name({scope, key})
 ```
 
 > #### `:via` and `:duplicate` mode {: .info}
@@ -120,17 +126,10 @@ PgRegistry.register(scope, key, value)          #=> {:ok, self()}
 > use `name: {:via, PgRegistry, ...}` to put a GenServer into a
 > group at start time (the registration succeeds, listeners fire,
 > and the pid is in the group), but you cannot subsequently
-> address it via that name — use `lookup/2`, `get_members/2`, or
+> address it via that name — use `lookup/2`, `lookup_local/2`, or
 > `dispatch/3` to enumerate instead.
 >
 > This is the same split `Registry` uses.
-PgRegistry.unregister(scope, key)               #=> :ok
-
-# via the explicit-pid API
-PgRegistry.register_name({scope, key}, pid)
-PgRegistry.register_name({scope, key, value}, pid)
-PgRegistry.unregister_name({scope, key})
-```
 
 A process may register multiple times under the same key (with
 possibly different values). Each registration is independent and must
@@ -141,18 +140,28 @@ notified.
 ### Reading
 
 ```elixir
-PgRegistry.lookup(scope, key)              # [{pid, value}, ...]
-PgRegistry.whereis_name({scope, key})      # pid | :undefined
-PgRegistry.get_members(scope, key)         # [pid, ...] (cluster-wide)
-PgRegistry.get_local_members(scope, key)   # [pid, ...] (local node only)
+PgRegistry.lookup(scope, key)              # [{pid, value}, ...] (cluster-wide)
+PgRegistry.lookup_local(scope, key)        # [{pid, value}, ...] (local node only)
 PgRegistry.values(scope, key, pid)         # [value, ...] for one pid
 PgRegistry.keys(scope, pid)                # [key, ...] for one pid
 PgRegistry.which_groups(scope)             # [key, ...]
 PgRegistry.count(scope)                    # total entries
 ```
 
+For a bare-pid view (e.g. `[pid, ...]`), use the Registry-idiomatic
+pattern:
+
+```elixir
+for {pid, _} <- PgRegistry.lookup(scope, key), do: pid
+```
+
 All read functions are lock-free, performed directly against ETS from
 the calling process. They never block on the GenServer.
+
+`lookup_local/2` is the one read that has no direct `Registry`
+analog — it's a distributed-registry concern. Useful for draining a
+node before shutdown, per-node metrics, or preferring a local
+instance before falling back.
 
 ### Updating values
 
