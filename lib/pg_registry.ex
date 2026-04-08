@@ -161,22 +161,79 @@ defmodule PgRegistry do
 
   # ---------------------------------------------------------------------------
   # :via callbacks
+  #
+  # The :via name protocol has two halves:
+  #
+  #   * write side — register_name/2, unregister_name/1. "Put this pid
+  #     under this key" / "take it out." Works fine in any mode,
+  #     including :duplicate.
+  #
+  #   * read/resolve side — whereis_name/1 and send/2 (and
+  #     transitively GenServer.call, GenServer.cast, Process.whereis,
+  #     and Kernel.send on a via tuple). "Give me THE pid under this
+  #     key." This is the ambiguous part: a :duplicate-keyed scope can
+  #     legitimately have many pids under one key, and the via
+  #     protocol only has room for one answer. Read-side callbacks
+  #     therefore require a scope started with keys: :unique and
+  #     raise ArgumentError otherwise.
+  #
+  # The practical consequence: you can use `name: {:via, PgRegistry, ...}`
+  # on a GenServer in a :duplicate-keyed scope (the GenServer starts
+  # fine, the registration succeeds, the listener fires), but you
+  # cannot subsequently address that GenServer via that name — you'll
+  # have to enumerate via `lookup/2`, `get_members/2`, or
+  # `dispatch/3`, or use the per-pid handle. For :unique-keyed scopes
+  # the full round-trip (register_name + whereis_name + send) works
+  # as expected.
+  #
+  # Because our :unique is per-node, the read-side callbacks resolve
+  # entirely on the current node — whereis_name/1 returns the local
+  # holder or :undefined, with no remote fallback.
   # ---------------------------------------------------------------------------
+
+  @via_resolve_unique """
+  PgRegistry's :via read callbacks (whereis_name/1, send/2, and by
+  extension GenServer.call, GenServer.cast, and Process.whereis on a
+  via tuple) require a scope started with `keys: :unique`. The via
+  protocol expects an unambiguous `name -> pid` mapping, which a
+  `:duplicate`-keyed scope cannot provide.
+
+  For duplicate-keyed scopes, enumerate members explicitly with
+  `lookup/2`, `get_members/2`, `match/3`, or `dispatch/3`, and
+  address pids directly.
+  """
 
   @doc """
   Registers `pid` under `{scope, key}` or `{scope, key, value}`.
 
-  Returns `:yes` on success, or `:no` if the scope was started with
-  `keys: :unique` and another local pid already holds this key.
+  Works in both `:duplicate` and `:unique` scopes — this is the write
+  side of the `:via` protocol, and "add this specific pid under this
+  key" is unambiguous regardless of mode.
 
-  Implements the `:via` callback. When called via
-  `GenServer.start_link(name: {:via, PgRegistry, ...})`, a `:no` reply
-  causes `gen.erl` to follow up with `whereis_name/1` and surface
-  `{:error, {:already_started, holder}}` automatically.
+    * In `:duplicate` mode: always returns `:yes`. Multiple pids can
+      be registered under the same key, including the same pid
+      multiple times with different values.
 
-  When you call `register_name/2` directly (not through `:via`), the
-  `:no` return does not carry the holder pid. Use `whereis_name/1` to
-  recover it if you need to know who the existing holder is.
+    * In `:unique` mode: returns `:yes` on success, or `:no` if
+      another local pid already holds this key.
+
+  When called via `GenServer.start_link(name: {:via, PgRegistry, ...})`,
+  a `:no` reply causes `gen.erl` to follow up with `whereis_name/1`
+  and surface `{:error, {:already_started, holder}}` automatically.
+
+  Direct callers (not via `:via`) don't receive the holder pid on the
+  `:no` branch. Use `whereis_name/1` (in unique mode) or `lookup/2`
+  (in either mode) to recover the holder if you need to know who
+  it is.
+
+  > #### Note on `:duplicate` mode and via tuples {: .info}
+  >
+  > You can use `name: {:via, PgRegistry, ...}` on a GenServer in a
+  > `:duplicate`-keyed scope, and the start will succeed. But
+  > subsequent `GenServer.call`, `GenServer.cast`, and `Process.whereis`
+  > on the via tuple will raise, because they call `whereis_name/1`
+  > which requires unique mode. Use `lookup/2` or `get_members/2` to
+  > enumerate pids instead.
   """
   @spec register_name(via_name(), pid()) :: :yes | :no
   def register_name({scope, key}, pid), do: do_register_name(scope, key, pid, nil)
@@ -190,7 +247,16 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Unregisters all local processes under `{scope, key}`. Always returns `:ok`.
+  Unregisters local processes registered under `{scope, key}`. Works
+  in both `:duplicate` and `:unique` modes.
+
+    * In `:duplicate` mode: removes every local pid that has an entry
+      under `key`. Remote pids are unaffected (they're owned by their
+      home node).
+
+    * In `:unique` mode: removes the at-most-one local holder.
+
+  Always returns `:ok`.
   """
   @spec unregister_name(via_name()) :: :ok
   def unregister_name({scope, key}), do: do_unregister(scope, key)
@@ -208,36 +274,57 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Looks up a single pid registered under `{scope, key}`. Local pids are
-  preferred. Returns `:undefined` if no process is registered.
+  Returns the pid registered under `{scope, key}` on the current
+  node, or `:undefined` if no local pid holds it.
 
-  Accepts both the 2-tuple `{scope, key}` and the 3-tuple
-  `{scope, key, value}` via name shapes. The `value` field is **only**
-  used at registration time — it is ignored here, because lookup is by
-  key. Asymmetric on purpose: a caller usually doesn't know the value
-  to look up by it, and several pids may be registered under the same
-  key with different values.
+  **Only works for scopes started with `keys: :unique`.** Raises
+  `ArgumentError` for a `:duplicate`-keyed scope, because the via
+  protocol expects a single pid and a duplicate-keyed registry can
+  legitimately have many. For duplicate-keyed scopes, use
+  `lookup/2`, `get_members/2`, or `dispatch/3` instead.
+
+  ## Resolution is local-only
+
+  Because our `keys: :unique` enforces per-node uniqueness, each
+  node has at most one holder per key. `whereis_name/1` only looks
+  on the current node — there is no remote fallback. If the calling
+  node has no local holder, `:undefined` is returned even if another
+  node in the cluster has one under the same key.
+
+  The practical implication: `GenServer.call({:via, PgRegistry, {scope, key}}, msg)`
+  from two different nodes can reach **two different processes** (one
+  per node), and a node with no local holder fails the call. This is
+  the intended shape of the per-node singleton pattern.
+
+  Both `{scope, key}` and `{scope, key, value}` via name shapes are
+  accepted; the `value` field is only used at registration time and
+  is ignored by lookup.
   """
   @spec whereis_name(via_name()) :: pid() | :undefined
-  def whereis_name({scope, key}), do: do_whereis(scope, key)
-  def whereis_name({scope, key, _value}), do: do_whereis(scope, key)
+  def whereis_name({scope, key}) do
+    ensure_unique!(scope)
+    do_whereis(scope, key)
+  end
+
+  def whereis_name({scope, key, _value}) do
+    ensure_unique!(scope)
+    do_whereis(scope, key)
+  end
 
   defp do_whereis(scope, key) do
     case Pg.get_local_members(scope, key) do
-      [pid | _] ->
-        pid
-
-      [] ->
-        case Pg.get_members(scope, key) do
-          [pid | _] -> pid
-          [] -> :undefined
-        end
+      [pid | _] -> pid
+      [] -> :undefined
     end
   end
 
   @doc """
-  Sends `msg` to a process registered under `{scope, key}`. Returns the
-  pid. Raises `ArgumentError` if no process is registered.
+  Sends `msg` to the local process registered under `{scope, key}`.
+  Returns the pid. Raises `ArgumentError` if no local process is
+  registered (see `whereis_name/1` for the "local-only" rule).
+
+  **Only works for scopes started with `keys: :unique`.** Raises
+  `ArgumentError` for a `:duplicate`-keyed scope.
   """
   @spec send(via_name(), term()) :: pid()
   def send(name, msg) do
@@ -248,6 +335,13 @@ defmodule PgRegistry do
       pid ->
         Kernel.send(pid, msg)
         pid
+    end
+  end
+
+  defp ensure_unique!(scope) do
+    case Pg.keys_mode(scope) do
+      :unique -> :ok
+      :duplicate -> raise ArgumentError, @via_resolve_unique
     end
   end
 

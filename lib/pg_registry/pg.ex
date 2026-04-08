@@ -321,6 +321,20 @@ defmodule PgRegistry.Pg do
 
   defp meta_table(scope), do: :"#{scope}_meta"
 
+  @doc """
+  Returns the `:keys` mode (`:unique` or `:duplicate`) a scope was
+  started with. Defaults to `:duplicate` for scopes that don't exist,
+  which matches the default of `start_link/1`.
+
+  Reads are backed by `:persistent_term` and don't go through the
+  scope GenServer, so this is safe to call on hot paths (e.g. inside
+  `:via` callbacks).
+  """
+  @spec keys_mode(scope()) :: :unique | :duplicate
+  def keys_mode(scope) do
+    :persistent_term.get({__MODULE__, scope, :keys}, :duplicate)
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer
   # ---------------------------------------------------------------------------
@@ -364,10 +378,22 @@ defmodule PgRegistry.Pg do
 
     keys =
       case Keyword.get(opts, :keys, :duplicate) do
-        :duplicate -> :duplicate
-        :unique -> :unique
-        other -> raise ArgumentError, "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
+        :duplicate ->
+          :duplicate
+
+        :unique ->
+          :unique
+
+        other ->
+          raise ArgumentError,
+                "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
       end
+
+    # Expose the mode via :persistent_term so Registry-shaped code can
+    # ask "what keys mode is this scope?" without a GenServer hop.
+    # Writes to persistent_term are costly (they scan processes) but
+    # happen at most once per scope start, which is fine.
+    :persistent_term.put({__MODULE__, scope, :keys}, keys)
 
     {:ok,
      %State{
@@ -663,6 +689,8 @@ defmodule PgRegistry.Pg do
 
     meta = meta_table(scope)
     if :ets.info(meta) != :undefined, do: :ets.delete(meta)
+
+    :persistent_term.erase({__MODULE__, scope, :keys})
 
     :ok
   end

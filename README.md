@@ -100,6 +100,30 @@ Supported options:
 
 # via the Registry-shaped API (registers self())
 PgRegistry.register(scope, key, value)          #=> {:ok, self()}
+```
+
+> #### `:via` and `:duplicate` mode {: .info}
+>
+> The `:via` protocol has two halves, and we treat them separately:
+>
+>   * **Write side** — `register_name/2` and `unregister_name/1`
+>     work in **both** `:duplicate` and `:unique` scopes. "Put this
+>     pid under this key" is unambiguous regardless of mode.
+>   * **Read side** — `whereis_name/1` and `send/2` (and by
+>     extension `GenServer.call`, `GenServer.cast`,
+>     `Process.whereis`, and `Kernel.send` on a via tuple) require
+>     a **`:unique`**-keyed scope. They raise `ArgumentError` in
+>     `:duplicate` mode because the via protocol expects a single
+>     pid and a duplicate-keyed scope can legitimately have many.
+>
+> Practical consequence: on a `:duplicate`-keyed scope you can
+> use `name: {:via, PgRegistry, ...}` to put a GenServer into a
+> group at start time (the registration succeeds, listeners fire,
+> and the pid is in the group), but you cannot subsequently
+> address it via that name — use `lookup/2`, `get_members/2`, or
+> `dispatch/3` to enumerate instead.
+>
+> This is the same split `Registry` uses.
 PgRegistry.unregister(scope, key)               #=> :ok
 
 # via the explicit-pid API
