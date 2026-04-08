@@ -1,7 +1,7 @@
 defmodule PgRegistry.MixProject do
   use Mix.Project
 
-  @version "0.2.2"
+  @version "0.3.0"
   @source_url "https://github.com/twinn/pg_registry"
 
   def project do
@@ -10,6 +10,7 @@ defmodule PgRegistry.MixProject do
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       description: description(),
       package: package(),
@@ -17,6 +18,9 @@ defmodule PgRegistry.MixProject do
       source_url: @source_url
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   # Run "mix help compile.app" to learn about applications.
   def application do
@@ -27,12 +31,16 @@ defmodule PgRegistry.MixProject do
 
   defp deps do
     [
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:styler, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
   defp description do
-    "A distributed process registry backed by Erlang's :pg module. Works like Elixir's Registry but discovers processes across clusters."
+    "A distributed, metadata-aware process registry for Elixir. " <>
+      "Cluster-aware like :pg, Registry-shaped API, per-process values, " <>
+      "listener notifications, and native ETS match-spec queries."
   end
 
   defp package do
