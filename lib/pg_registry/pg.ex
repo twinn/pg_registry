@@ -973,7 +973,7 @@ defmodule PgRegistry.Pg do
         {:ok, existing} -> existing
       end
 
-    sync_groups(scope, remote_groups, groups)
+    :ok = sync_groups(scope, remote_groups, groups)
     Map.put(remote, peer, {mref, Map.new(groups)})
   end
 
@@ -983,6 +983,8 @@ defmodule PgRegistry.Pg do
     for {group, entries} <- remote_groups, {_pid, _meta, tag} <- entries do
       :ets.match_delete(scope, {group, :_, :_, tag})
     end
+
+    :ok
   end
 
   defp sync_groups(scope, remote_groups, [{group, new_entries} | tail]) do
@@ -995,7 +997,7 @@ defmodule PgRegistry.Pg do
         sync_groups(scope, remote_groups, tail)
 
       {old_entries, new_remote_groups} ->
-        sync_one_group(scope, group, old_entries, new_entries)
+        :ok = sync_one_group(scope, group, old_entries, new_entries)
         sync_groups(scope, new_remote_groups, tail)
     end
   end
@@ -1029,6 +1031,8 @@ defmodule PgRegistry.Pg do
     for {pid, meta, tag} <- new_entries, not MapSet.member?(old_set, {pid, tag}) do
       :ets.insert(scope, {group, pid, meta, tag})
     end
+
+    :ok
   end
 
   # Walks the ETS table for every row whose pid is local. Returns
