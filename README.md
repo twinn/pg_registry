@@ -47,44 +47,34 @@ PgRegistry.whereis_name({:my_registry, :my_key})
 ## Why PgRegistry
 
 PgRegistry is a **duplicate-keyed, cluster-aware process registry**.
-It's meant to fill a specific hole in the ecosystem — the space where
-you want many processes under one key, visible across the cluster,
-without paying consensus costs.
+Many processes can register under one key, entries gossip between
+nodes automatically, and the API is shaped like Elixir's `Registry`.
 
-| | `Registry` | `:global` | `Horde.Registry` | `PgRegistry` |
-|---|---|---|---|---|
-| Scope | one node | whole cluster | whole cluster | whole cluster |
-| Underlying model | ETS + GenServer | cluster-wide lock | delta-CRDT | `:pg`-style gossip |
-| Cost per register | µs | ms (cluster-wide lock) | µs + async CRDT delta | µs + async broadcast |
-| Convergence model | n/a | synchronous, lock-based | eventual, CRDT merge | eventual, gossip |
-| Net-split behavior | n/a | collisions on heal resolved by a user-supplied resolver, may kill processes | CRDT merge picks a winner, losing registrations silently dropped | diverges silently, converges on heal without conflict (duplicates are the normal state) |
-| **Duplicate keys** | yes | no | no | **yes (default)** |
-| **Unique keys** | yes (per-node) | yes (cluster-wide) | yes (cluster-wide) | yes (per-node only) |
-| Per-process values | yes | no | yes | yes |
-| Match-spec queries | yes (ETS-native) | no | yes | yes (ETS-native) |
-| Listeners | yes | no | yes | yes |
+| | `Registry` | `:pg` | `:global` | `Horde.Registry` | `PgRegistry` |
+|---|---|---|---|---|---|
+| Scope | one node | whole cluster | whole cluster | whole cluster | whole cluster |
+| Underlying model | ETS + GenServer | gen_server + gossip | cluster-wide lock | delta-CRDT | gen_server + gossip |
+| Cost per register | µs | µs + async broadcast | ms (cluster-wide lock) | µs + async CRDT delta | µs + async broadcast |
+| Convergence model | n/a | eventual, gossip | synchronous, lock-based | eventual, CRDT merge | eventual, gossip |
+| Net-split behavior | n/a | diverges silently, converges on heal without conflict | collisions on heal resolved by a user-supplied resolver, may kill processes | CRDT merge picks a winner, losing registrations silently dropped | diverges silently, converges on heal without conflict |
+| Duplicate keys | yes | yes (only mode) | no | no | yes (default) |
+| Unique keys | yes (per-node) | no | yes (cluster-wide) | yes (cluster-wide) | yes (per-node only) |
+| Per-process values | yes | no | no | yes | yes |
+| Match-spec queries | yes (ETS-native) | no | no | yes | yes (ETS-native) |
+| Listeners | yes | no | no | yes | yes |
+| Part of OTP | yes | yes | yes | no | no |
+| Interop with other Erlang/OTP apps | no | yes | yes | no | no |
 
 ### Which should I use?
 
 | If you need… | Reach for |
 |---|---|
-| A group of processes under one key, cluster-wide | **`PgRegistry`** |
-| Exactly one process per name, cluster-wide (a singleton) | **`Horde.Registry`** |
-| A single-node registry with metadata and match-specs | **`Registry`** |
-| Cluster-wide name uniqueness with strong semantics, OK with the latency | **`:global`** |
-| Both cluster-wide singletons *and* cluster-wide groups in the same app | **`Horde.Registry` + `PgRegistry`** (they don't conflict) |
-
-The short version: **`Horde.Registry` owns the unique-key problem
-space. `PgRegistry` owns the duplicate-key problem space.** They're
-complementary, not competitors. `Registry` is fast but local.
-`:global` is cluster-wide but slow and has famously tricky
-net-split semantics.
-
-PgRegistry deliberately does not try to do what `Horde.Registry`
-does. We don't enforce cluster-wide uniqueness. In exchange, we
-get a much smaller moving-parts footprint, no consensus or CRDT
-machinery, and a gossip model that converges cleanly from
-netsplits because duplicates are the normal state.
+| A group of processes under one key, cluster-wide, with values and a Registry-shaped API | `PgRegistry` |
+| Bare-bones cluster-wide process groups (pids only), or interop with an existing `:pg` user in another OTP app | `:pg` |
+| Exactly one process per name, cluster-wide (a singleton) | `Horde.Registry` |
+| A single-node registry with metadata and match-specs | `Registry` |
+| Cluster-wide name uniqueness with strong semantics, OK with the latency | `:global` |
+| Both cluster-wide singletons and cluster-wide groups in the same app | `Horde.Registry` and `PgRegistry` together |
 
 ## API
 
