@@ -296,11 +296,25 @@ defmodule PgRegistry.Pg do
   #
   # Local-only. Stored in a sibling ETS table named `:"#{scope}_meta"` so
   # reads can bypass the GenServer the same way the entries table can.
+  #
+  # Keys are restricted to atoms and tuples, matching Elixir's
+  # `Registry.meta/2,3` family (which has the same guard). This is
+  # tighter than "any term" on purpose: it matches what a Registry
+  # refugee would expect, and it surfaces typos in key names as a
+  # FunctionClauseError at the API boundary rather than a silent
+  # lookup miss. The guard runs in the public API so callers see a
+  # clean raise instead of a gen_server exit.
   # ---------------------------------------------------------------------------
 
+  @typedoc """
+  Keys accepted by the scope metadata API. Matches `Registry`'s
+  `meta_key` type: atoms or tuples of any shape.
+  """
+  @type meta_key :: atom() | tuple()
+
   @doc "Returns `{:ok, value}` if `key` is set in `scope`'s metadata, else `:error`."
-  @spec get_scope_meta(scope(), term()) :: {:ok, term()} | :error
-  def get_scope_meta(scope, key) do
+  @spec get_scope_meta(scope(), meta_key()) :: {:ok, term()} | :error
+  def get_scope_meta(scope, key) when is_atom(key) or is_tuple(key) do
     case :ets.lookup(meta_table(scope), key) do
       [{^key, value}] -> {:ok, value}
       [] -> :error
@@ -308,14 +322,14 @@ defmodule PgRegistry.Pg do
   end
 
   @doc "Sets `key` to `value` in `scope`'s metadata."
-  @spec put_scope_meta(scope(), term(), term()) :: :ok
-  def put_scope_meta(scope, key, value) do
+  @spec put_scope_meta(scope(), meta_key(), term()) :: :ok
+  def put_scope_meta(scope, key, value) when is_atom(key) or is_tuple(key) do
     GenServer.call(scope, {:put_scope_meta, key, value}, :infinity)
   end
 
   @doc "Removes `key` from `scope`'s metadata."
-  @spec delete_scope_meta(scope(), term()) :: :ok
-  def delete_scope_meta(scope, key) do
+  @spec delete_scope_meta(scope(), meta_key()) :: :ok
+  def delete_scope_meta(scope, key) when is_atom(key) or is_tuple(key) do
     GenServer.call(scope, {:delete_scope_meta, key}, :infinity)
   end
 

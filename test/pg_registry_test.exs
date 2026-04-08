@@ -846,13 +846,37 @@ defmodule PgRegistryTest do
   end
 
   describe "meta/2, put_meta/3, delete_meta/2" do
-    test "round-trip", %{scope: scope} do
+    test "round-trip with an atom key", %{scope: scope} do
       assert :error = PgRegistry.meta(scope, :config)
       assert :ok = PgRegistry.put_meta(scope, :config, %{retries: 3})
       assert {:ok, %{retries: 3}} == PgRegistry.meta(scope, :config)
 
       assert :ok = PgRegistry.delete_meta(scope, :config)
       assert :error = PgRegistry.meta(scope, :config)
+    end
+
+    test "round-trip with a tuple key", %{scope: scope} do
+      assert :ok = PgRegistry.put_meta(scope, {:ns, :limit}, 100)
+      assert {:ok, 100} == PgRegistry.meta(scope, {:ns, :limit})
+      assert :ok = PgRegistry.delete_meta(scope, {:ns, :limit})
+      assert :error = PgRegistry.meta(scope, {:ns, :limit})
+    end
+
+    test "non-atom, non-tuple keys are rejected", %{scope: scope} do
+      # Matches Registry.meta's `is_atom(key) or is_tuple(key)` guard.
+      for bad_key <- ["string", 42, [:list], %{map: true}] do
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.meta(scope, bad_key)
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.put_meta(scope, bad_key, :v)
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.delete_meta(scope, bad_key)
+        end
+      end
     end
   end
 

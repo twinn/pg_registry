@@ -738,6 +738,9 @@ defmodule PgRegistry do
   Returns `{:ok, value}` if `key` is set in `scope`'s metadata, else
   `:error`. Local-only — metadata is not gossiped between nodes.
 
+  Keys must be atoms or tuples, matching `Registry.meta/2`'s
+  `meta_key` contract. Other shapes raise `FunctionClauseError`.
+
   ## Examples
 
       iex> {:ok, _} = PgRegistry.start_link(:doc_meta)
@@ -747,19 +750,29 @@ defmodule PgRegistry do
       :ok
       iex> PgRegistry.meta(:doc_meta, :config)
       {:ok, %{retries: 3}}
+      iex> PgRegistry.put_meta(:doc_meta, {:ns, :limit}, 100)
+      :ok
+      iex> PgRegistry.meta(:doc_meta, {:ns, :limit})
+      {:ok, 100}
       iex> PgRegistry.delete_meta(:doc_meta, :config)
       :ok
       iex> PgRegistry.meta(:doc_meta, :config)
       :error
   """
-  @spec meta(scope(), term()) :: {:ok, term()} | :error
+  @spec meta(scope(), Pg.meta_key()) :: {:ok, term()} | :error
   defdelegate meta(scope, key), to: Pg, as: :get_scope_meta
 
-  @doc "Sets `key` to `value` in `scope`'s local metadata."
-  @spec put_meta(scope(), term(), term()) :: :ok
+  @doc """
+  Sets `key` to `value` in `scope`'s local metadata. Keys must be
+  atoms or tuples.
+  """
+  @spec put_meta(scope(), Pg.meta_key(), term()) :: :ok
   defdelegate put_meta(scope, key, value), to: Pg, as: :put_scope_meta
 
-  @doc "Removes `key` from `scope`'s local metadata."
-  @spec delete_meta(scope(), term()) :: :ok
+  @doc """
+  Removes `key` from `scope`'s local metadata. Keys must be atoms or
+  tuples.
+  """
+  @spec delete_meta(scope(), Pg.meta_key()) :: :ok
   defdelegate delete_meta(scope, key), to: Pg, as: :delete_scope_meta
 end
