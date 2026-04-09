@@ -296,11 +296,25 @@ defmodule PgRegistry.Pg do
   #
   # Local-only. Stored in a sibling ETS table named `:"#{scope}_meta"` so
   # reads can bypass the GenServer the same way the entries table can.
+  #
+  # Keys are restricted to atoms and tuples, matching Elixir's
+  # `Registry.meta/2,3` family (which has the same guard). This is
+  # tighter than "any term" on purpose: it matches what a Registry
+  # refugee would expect, and it surfaces typos in key names as a
+  # FunctionClauseError at the API boundary rather than a silent
+  # lookup miss. The guard runs in the public API so callers see a
+  # clean raise instead of a gen_server exit.
   # ---------------------------------------------------------------------------
 
+  @typedoc """
+  Keys accepted by the scope metadata API. Matches `Registry`'s
+  `meta_key` type: atoms or tuples of any shape.
+  """
+  @type meta_key :: atom() | tuple()
+
   @doc "Returns `{:ok, value}` if `key` is set in `scope`'s metadata, else `:error`."
-  @spec get_scope_meta(scope(), term()) :: {:ok, term()} | :error
-  def get_scope_meta(scope, key) do
+  @spec get_scope_meta(scope(), meta_key()) :: {:ok, term()} | :error
+  def get_scope_meta(scope, key) when is_atom(key) or is_tuple(key) do
     case :ets.lookup(meta_table(scope), key) do
       [{^key, value}] -> {:ok, value}
       [] -> :error
@@ -308,18 +322,32 @@ defmodule PgRegistry.Pg do
   end
 
   @doc "Sets `key` to `value` in `scope`'s metadata."
-  @spec put_scope_meta(scope(), term(), term()) :: :ok
-  def put_scope_meta(scope, key, value) do
+  @spec put_scope_meta(scope(), meta_key(), term()) :: :ok
+  def put_scope_meta(scope, key, value) when is_atom(key) or is_tuple(key) do
     GenServer.call(scope, {:put_scope_meta, key, value}, :infinity)
   end
 
   @doc "Removes `key` from `scope`'s metadata."
-  @spec delete_scope_meta(scope(), term()) :: :ok
-  def delete_scope_meta(scope, key) do
+  @spec delete_scope_meta(scope(), meta_key()) :: :ok
+  def delete_scope_meta(scope, key) when is_atom(key) or is_tuple(key) do
     GenServer.call(scope, {:delete_scope_meta, key}, :infinity)
   end
 
   defp meta_table(scope), do: :"#{scope}_meta"
+
+  @doc """
+  Returns the `:keys` mode (`:unique` or `:duplicate`) a scope was
+  started with. Defaults to `:duplicate` for scopes that don't exist,
+  which matches the default of `start_link/1`.
+
+  Reads are backed by `:persistent_term` and don't go through the
+  scope GenServer, so this is safe to call on hot paths (e.g. inside
+  `:via` callbacks).
+  """
+  @spec keys_mode(scope()) :: :unique | :duplicate
+  def keys_mode(scope) do
+    :persistent_term.get({__MODULE__, scope, :keys}, :duplicate)
+  end
 
   # ---------------------------------------------------------------------------
   # GenServer
@@ -364,10 +392,22 @@ defmodule PgRegistry.Pg do
 
     keys =
       case Keyword.get(opts, :keys, :duplicate) do
-        :duplicate -> :duplicate
-        :unique -> :unique
-        other -> raise ArgumentError, "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
+        :duplicate ->
+          :duplicate
+
+        :unique ->
+          :unique
+
+        other ->
+          raise ArgumentError,
+                "expected :keys to be :duplicate or :unique, got: #{inspect(other)}"
       end
+
+    # Expose the mode via :persistent_term so Registry-shaped code can
+    # ask "what keys mode is this scope?" without a GenServer hop.
+    # Writes to persistent_term are costly (they scan processes) but
+    # happen at most once per scope start, which is fine.
+    :persistent_term.put({__MODULE__, scope, :keys}, keys)
 
     {:ok,
      %State{
@@ -664,6 +704,8 @@ defmodule PgRegistry.Pg do
     meta = meta_table(scope)
     if :ets.info(meta) != :undefined, do: :ets.delete(meta)
 
+    :persistent_term.erase({__MODULE__, scope, :keys})
+
     :ok
   end
 
@@ -945,7 +987,7 @@ defmodule PgRegistry.Pg do
         {:ok, existing} -> existing
       end
 
-    sync_groups(scope, remote_groups, groups)
+    :ok = sync_groups(scope, remote_groups, groups)
     Map.put(remote, peer, {mref, Map.new(groups)})
   end
 
@@ -955,6 +997,8 @@ defmodule PgRegistry.Pg do
     for {group, entries} <- remote_groups, {_pid, _meta, tag} <- entries do
       :ets.match_delete(scope, {group, :_, :_, tag})
     end
+
+    :ok
   end
 
   defp sync_groups(scope, remote_groups, [{group, new_entries} | tail]) do
@@ -967,7 +1011,7 @@ defmodule PgRegistry.Pg do
         sync_groups(scope, remote_groups, tail)
 
       {old_entries, new_remote_groups} ->
-        sync_one_group(scope, group, old_entries, new_entries)
+        :ok = sync_one_group(scope, group, old_entries, new_entries)
         sync_groups(scope, new_remote_groups, tail)
     end
   end
@@ -1001,6 +1045,8 @@ defmodule PgRegistry.Pg do
     for {pid, meta, tag} <- new_entries, not MapSet.member?(old_set, {pid, tag}) do
       :ets.insert(scope, {group, pid, meta, tag})
     end
+
+    :ok
   end
 
   # Walks the ETS table for every row whose pid is local. Returns

@@ -15,6 +15,7 @@ defmodule PgRegistry.MixProject do
       description: description(),
       package: package(),
       docs: docs(),
+      dialyzer: dialyzer(),
       source_url: @source_url
     ]
   end
@@ -33,7 +34,16 @@ defmodule PgRegistry.MixProject do
     [
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:styler, "~> 1.4", only: [:dev, :test], runtime: false}
+      {:styler, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  defp dialyzer do
+    [
+      plt_file: {:no_warnings_as_errors, "priv/plts/project.plt"},
+      plt_core_path: "priv/plts/core.plt",
+      flags: [:error_handling, :unknown, :unmatched_returns]
     ]
   end
 

@@ -1,10 +1,23 @@
 defmodule PgRegistryTest do
   use ExUnit.Case
 
+  alias PgRegistry.Pg
+
+  doctest PgRegistry
+
   setup do
     scope = :"test_#{:erlang.unique_integer([:positive])}"
     start_supervised!({PgRegistry, scope})
     {:ok, scope: scope}
+  end
+
+  # Starts an additional scope in :unique mode for tests that exercise
+  # the :via callbacks. Kept as a helper (not the default setup) so
+  # most tests can stay in the simpler :duplicate default.
+  defp start_unique_scope do
+    name = :"test_unique_#{:erlang.unique_integer([:positive])}"
+    start_supervised!({PgRegistry, name: name, keys: :unique}, id: name)
+    name
   end
 
   describe "start_link/1" do
@@ -13,88 +26,123 @@ defmodule PgRegistryTest do
     end
   end
 
-  describe "register_name/2" do
-    test "registers a process under a key", %{scope: scope} do
-      assert :yes = PgRegistry.register_name({scope, :my_key}, self())
+  describe "register_name/2 (via callback, works in both modes)" do
+    test "registers a pid in :duplicate mode", %{scope: dup} do
+      assert :yes = PgRegistry.register_name({dup, :my_key}, self())
+      assert [{self(), nil}] == PgRegistry.lookup(dup, :my_key)
     end
 
+    test "a second registration in :duplicate mode also returns :yes", %{scope: dup} do
+      assert :yes = PgRegistry.register_name({dup, :my_key}, self())
+      # Same pid under same key again — duplicates allowed
+      assert :yes = PgRegistry.register_name({dup, :my_key}, self())
+      assert length(PgRegistry.lookup(dup, :my_key)) == 2
+    end
+
+    test "registers a pid in :unique mode" do
+      unique = start_unique_scope()
+      assert :yes = PgRegistry.register_name({unique, :my_key}, self())
+    end
+
+    test "returns :no on collision in :unique mode" do
+      unique = start_unique_scope()
+      assert :yes = PgRegistry.register_name({unique, :my_key}, self())
+      assert :no = PgRegistry.register_name({unique, :my_key}, self())
+    end
+  end
+
+  describe "whereis_name/1 (unique mode, via callback)" do
+    test "returns pid for a registered local process" do
+      unique = start_unique_scope()
+      PgRegistry.register_name({unique, :my_key}, self())
+      assert self() == PgRegistry.whereis_name({unique, :my_key})
+    end
+
+    test "returns :undefined for unregistered key" do
+      unique = start_unique_scope()
+      assert :undefined == PgRegistry.whereis_name({unique, :no_such_key})
+    end
+
+    test "returns :undefined after unregister" do
+      unique = start_unique_scope()
+      PgRegistry.register_name({unique, :my_key}, self())
+      assert self() == PgRegistry.whereis_name({unique, :my_key})
+
+      PgRegistry.unregister_name({unique, :my_key})
+      assert :undefined == PgRegistry.whereis_name({unique, :my_key})
+    end
+
+    test "raises in :duplicate mode", %{scope: dup} do
+      assert_raise ArgumentError, ~r/:unique/, fn ->
+        PgRegistry.whereis_name({dup, :my_key})
+      end
+    end
+  end
+
+  describe "unregister_name/1 (via callback, works in both modes)" do
+    test "removes local entries under key in :duplicate mode", %{scope: dup} do
+      PgRegistry.register_name({dup, :my_key}, self())
+      assert [{self(), nil}] == PgRegistry.lookup(dup, :my_key)
+
+      assert :ok = PgRegistry.unregister_name({dup, :my_key})
+      assert [] == PgRegistry.lookup(dup, :my_key)
+    end
+
+    test "removes the holder in :unique mode" do
+      unique = start_unique_scope()
+      PgRegistry.register_name({unique, :my_key}, self())
+      assert :ok = PgRegistry.unregister_name({unique, :my_key})
+      assert :undefined == PgRegistry.whereis_name({unique, :my_key})
+    end
+
+    test "is a no-op when nothing is registered" do
+      unique = start_unique_scope()
+      assert :ok = PgRegistry.unregister_name({unique, :nope})
+    end
+  end
+
+  describe "send/2 (unique mode, via callback)" do
+    test "sends a message to a registered process" do
+      unique = start_unique_scope()
+      PgRegistry.register_name({unique, :my_key}, self())
+      PgRegistry.send({unique, :my_key}, :hello)
+      assert_receive :hello
+    end
+
+    test "raises for unregistered key" do
+      unique = start_unique_scope()
+
+      assert_raise ArgumentError, fn ->
+        PgRegistry.send({unique, :no_such_key}, :hello)
+      end
+    end
+
+    test "raises in :duplicate mode", %{scope: dup} do
+      assert_raise ArgumentError, ~r/:unique/, fn ->
+        PgRegistry.send({dup, :my_key}, :hello)
+      end
+    end
+  end
+
+  describe "multi-pid join in :duplicate mode" do
     test "allows multiple processes to register under the same key", %{scope: scope} do
       task =
         Task.async(fn ->
-          PgRegistry.register_name({scope, :my_key}, self())
+          Pg.join(scope, :my_key, self())
           Process.sleep(:infinity)
         end)
 
       Process.sleep(50)
 
-      assert :yes = PgRegistry.register_name({scope, :my_key}, self())
-      assert length(PgRegistry.get_members(scope, :my_key)) == 2
+      :ok = Pg.join(scope, :my_key, self())
+      assert length(PgRegistry.lookup(scope, :my_key)) == 2
 
       Task.shutdown(task, :brutal_kill)
     end
   end
 
-  describe "whereis_name/1" do
-    test "returns pid for registered process", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-      assert self() == PgRegistry.whereis_name({scope, :my_key})
-    end
-
-    test "returns :undefined for unregistered key", %{scope: scope} do
-      assert :undefined == PgRegistry.whereis_name({scope, :no_such_key})
-    end
-
-    test "prefers local members", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-
-      assert self() == PgRegistry.whereis_name({scope, :my_key})
-      assert [self()] == PgRegistry.Pg.get_local_members(scope, :my_key)
-    end
-
-    test "falls back to remote members when no local members exist", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-      assert self() == PgRegistry.whereis_name({scope, :my_key})
-
-      # On a single node, get_members returns the same as get_local_members,
-      # so this just verifies the fallback path doesn't break
-      PgRegistry.unregister_name({scope, :my_key})
-      assert :undefined == PgRegistry.whereis_name({scope, :my_key})
-    end
-  end
-
-  describe "unregister_name/1" do
-    test "removes a registration", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-      assert :ok = PgRegistry.unregister_name({scope, :my_key})
-      assert :undefined == PgRegistry.whereis_name({scope, :my_key})
-    end
-
-    test "only unregisters local members", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-      assert [self()] == PgRegistry.Pg.get_local_members(scope, :my_key)
-
-      PgRegistry.unregister_name({scope, :my_key})
-
-      assert [] == PgRegistry.Pg.get_local_members(scope, :my_key)
-    end
-  end
-
-  describe "send/2" do
-    test "sends a message to a registered process", %{scope: scope} do
-      PgRegistry.register_name({scope, :my_key}, self())
-      PgRegistry.send({scope, :my_key}, :hello)
-      assert_receive :hello
-    end
-
-    test "raises for unregistered key", %{scope: scope} do
-      assert_raise ArgumentError, fn ->
-        PgRegistry.send({scope, :no_such_key}, :hello)
-      end
-    end
-  end
-
-  describe "get_members/2" do
-    test "returns all processes registered under a key", %{scope: scope} do
+  describe "lookup/2 returns all entries under a key" do
+    test "includes every registered pid, across all callers", %{scope: scope} do
       task1 =
         Task.async(fn ->
           PgRegistry.register_name({scope, :group}, self())
@@ -109,17 +157,29 @@ defmodule PgRegistryTest do
 
       Process.sleep(50)
 
-      members = PgRegistry.get_members(scope, :group)
-      assert length(members) == 2
-      assert task1.pid in members
-      assert task2.pid in members
+      entries = PgRegistry.lookup(scope, :group)
+      assert length(entries) == 2
+      pids = for {pid, _} <- entries, do: pid
+      assert task1.pid in pids
+      assert task2.pid in pids
 
       Task.shutdown(task1, :brutal_kill)
       Task.shutdown(task2, :brutal_kill)
     end
 
     test "returns empty list for unknown key", %{scope: scope} do
-      assert [] == PgRegistry.get_members(scope, :no_such_key)
+      assert [] == PgRegistry.lookup(scope, :no_such_key)
+    end
+  end
+
+  describe "lookup_local/2" do
+    test "returns the same entries as lookup/2 on a single node", %{scope: scope} do
+      PgRegistry.register_name({scope, :worker, :v1}, self())
+      assert PgRegistry.lookup(scope, :worker) == PgRegistry.lookup_local(scope, :worker)
+    end
+
+    test "returns [] for unknown key", %{scope: scope} do
+      assert [] == PgRegistry.lookup_local(scope, :nope)
     end
   end
 
@@ -171,9 +231,8 @@ defmodule PgRegistryTest do
         for pid <- members, do: send(pid, :work)
       end)
 
-      # Verify all 3 received the message via get_members
-      members = PgRegistry.get_members(scope, :workers)
-      assert length(members) == 3
+      # Verify all 3 are registered via lookup
+      assert length(PgRegistry.lookup(scope, :workers)) == 3
     end
 
     test "does not invoke callback when no members", %{scope: scope} do
@@ -184,17 +243,11 @@ defmodule PgRegistryTest do
   end
 
   describe "process cleanup" do
-    test "dead process is automatically removed", %{scope: scope} do
-      pid = spawn(fn -> :ok end)
-      # Wait for process to die
-      ref = Process.monitor(pid)
+    test "dead process is automatically removed" do
+      # Use a unique scope so we can exercise whereis_name's
+      # is_registered? / is-undefined? semantics.
+      scope = start_unique_scope()
 
-      receive do
-        {:DOWN, ^ref, _, _, _} -> :ok
-      end
-
-      # pg won't have it since it died before/during join,
-      # but let's register a living process, kill it, and verify cleanup
       task =
         Task.async(fn ->
           PgRegistry.register_name({scope, :ephemeral}, self())
@@ -212,8 +265,9 @@ defmodule PgRegistryTest do
     end
   end
 
-  describe "GenServer via tuple integration" do
-    test "can start and call a GenServer via PgRegistry", %{scope: scope} do
+  describe "GenServer via tuple integration (unique mode)" do
+    test "can start and call a GenServer via PgRegistry" do
+      scope = start_unique_scope()
       {:ok, pid} = Agent.start_link(fn -> 0 end, name: {:via, PgRegistry, {scope, :my_agent}})
       assert pid == PgRegistry.whereis_name({scope, :my_agent})
       assert 0 == Agent.get({:via, PgRegistry, {scope, :my_agent}}, & &1)
@@ -222,7 +276,9 @@ defmodule PgRegistryTest do
       assert 1 == Agent.get({:via, PgRegistry, {scope, :my_agent}}, & &1)
     end
 
-    test "3-element via tuple attaches a value at registration", %{scope: scope} do
+    test "3-element via tuple attaches a value at registration" do
+      scope = start_unique_scope()
+
       {:ok, pid} =
         Agent.start_link(fn -> :state end,
           name: {:via, PgRegistry, {scope, :tagged_agent, %{role: :primary}}}
@@ -230,6 +286,16 @@ defmodule PgRegistryTest do
 
       assert pid == PgRegistry.whereis_name({scope, :tagged_agent})
       assert [{^pid, %{role: :primary}}] = PgRegistry.lookup(scope, :tagged_agent)
+    end
+
+    test "second start with the same via name returns {:error, {:already_started, pid}}" do
+      scope = start_unique_scope()
+
+      {:ok, pid1} =
+        Agent.start_link(fn -> :a end, name: {:via, PgRegistry, {scope, :singleton}})
+
+      assert {:error, {:already_started, ^pid1}} =
+               Agent.start_link(fn -> :b end, name: {:via, PgRegistry, {scope, :singleton}})
     end
   end
 
@@ -780,13 +846,37 @@ defmodule PgRegistryTest do
   end
 
   describe "meta/2, put_meta/3, delete_meta/2" do
-    test "round-trip", %{scope: scope} do
+    test "round-trip with an atom key", %{scope: scope} do
       assert :error = PgRegistry.meta(scope, :config)
       assert :ok = PgRegistry.put_meta(scope, :config, %{retries: 3})
       assert {:ok, %{retries: 3}} == PgRegistry.meta(scope, :config)
 
       assert :ok = PgRegistry.delete_meta(scope, :config)
       assert :error = PgRegistry.meta(scope, :config)
+    end
+
+    test "round-trip with a tuple key", %{scope: scope} do
+      assert :ok = PgRegistry.put_meta(scope, {:ns, :limit}, 100)
+      assert {:ok, 100} == PgRegistry.meta(scope, {:ns, :limit})
+      assert :ok = PgRegistry.delete_meta(scope, {:ns, :limit})
+      assert :error = PgRegistry.meta(scope, {:ns, :limit})
+    end
+
+    test "non-atom, non-tuple keys are rejected", %{scope: scope} do
+      # Matches Registry.meta's `is_atom(key) or is_tuple(key)` guard.
+      for bad_key <- ["string", 42, [:list], %{map: true}] do
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.meta(scope, bad_key)
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.put_meta(scope, bad_key, :v)
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          PgRegistry.delete_meta(scope, bad_key)
+        end
+      end
     end
   end
 
