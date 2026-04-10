@@ -381,7 +381,7 @@ defmodule PgRegistry.Pg do
     :ok = :net_kernel.monitor_nodes(true)
 
     for node <- Node.list() do
-      send({scope, node}, {:discover, self(), @protocol_version})
+      :erlang.send({scope, node}, {:discover, self(), @protocol_version}, [:noconnect])
     end
 
     ^scope =
@@ -687,7 +687,7 @@ defmodule PgRegistry.Pg do
   def handle_info({:nodeup, node}, %State{} = s) when node == node(), do: {:noreply, s}
 
   def handle_info({:nodeup, node}, %State{scope: scope} = s) do
-    send({scope, node}, {:discover, self(), @protocol_version})
+    :erlang.send({scope, node}, {:discover, self(), @protocol_version}, [:noconnect])
     {:noreply, s}
   end
 
@@ -720,7 +720,7 @@ defmodule PgRegistry.Pg do
       {:noreply, s}
     else
       mref = Process.monitor(peer)
-      send(peer, {:discover, self(), @protocol_version})
+      :erlang.send(peer, {:discover, self(), @protocol_version}, [:noconnect])
       {:noreply, %{s | remote: Map.put(remote, peer, {mref, %{}})}}
     end
   end
@@ -1067,7 +1067,11 @@ defmodule PgRegistry.Pg do
   defp broadcast([], _msg), do: :ok
 
   defp broadcast([dest | tail], msg) do
-    send(dest, msg)
+    # [:noconnect] matches pg.erl — if the peer is disconnected, we
+    # don't want to block trying to re-establish the connection. The
+    # message is silently dropped; the next nodeup will trigger a
+    # fresh discover/sync anyway.
+    :erlang.send(dest, msg, [:noconnect])
     broadcast(tail, msg)
   end
 
