@@ -1,22 +1,21 @@
 # PgRegistry
 
-A distributed, metadata-aware process registry for Elixir. Works like
-Elixir's [`Registry`](https://hexdocs.pm/elixir/Registry.html) but
-discovers processes across a cluster, with the same gossip-based
-eventually-consistent membership model as Erlang's `:pg`.
+A distributed, cluster-aware process registry for Elixir with per-entry
+metadata.
 
-PgRegistry exposes a Registry-shaped API on top of a self-contained
-Elixir port of `:pg` that has been extended to carry per-entry
-metadata. You get cluster-wide process discovery, per-process values,
-listener notifications, and ETS-native match-spec queries — all
-without `:global`'s coordination tax.
+PgRegistry provides a `Registry`-shaped API on top of a self-contained
+Elixir port of Erlang's `:pg` extended with per-entry metadata. Entries
+are replicated across the cluster through gossip-based eventually
+consistent membership. The API supports duplicate and per-node unique
+keys, per-process values, listener notifications, ETS-native match-spec
+queries, and runtime subscriptions.
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:pg_registry, "~> 0.3"}
+    {:pg_registry, "~> 0.4"}
   ]
 end
 ```
@@ -24,19 +23,19 @@ end
 ## Quick start
 
 ```elixir
-# In your supervision tree
+# In a supervision tree
 children = [
   {PgRegistry, :my_registry}
 ]
 
-# Register a process by name (via tuple)
+# Register a process via a :via tuple
 GenServer.start_link(MyServer, arg,
   name: {:via, PgRegistry, {:my_registry, :my_key}})
 
-# Or register the calling process directly
+# Register the calling process directly with metadata
 {:ok, _} = PgRegistry.register(:my_registry, :worker, %{role: :primary})
 
-# Look up across the cluster
+# Look up entries across the cluster
 PgRegistry.lookup(:my_registry, :worker)
 #=> [{#PID<0.123.0>, %{role: :primary}}]
 
@@ -44,19 +43,20 @@ PgRegistry.whereis_name({:my_registry, :my_key})
 #=> #PID<0.456.0>
 ```
 
-## Why PgRegistry
+## Comparison
 
-PgRegistry is a **duplicate-keyed, cluster-aware process registry**.
-Many processes can register under one key, entries gossip between
-nodes automatically, and the API is shaped like Elixir's `Registry`.
+PgRegistry is a duplicate-keyed, cluster-aware process registry.
+Multiple processes can register under one key, entries are gossiped
+between nodes automatically, and the API follows the shape of Elixir's
+`Registry`.
 
 | | `Registry` | `:pg` | `:global` | `Horde.Registry` | `PgRegistry` |
 |---|---|---|---|---|---|
-| Scope | one node | whole cluster | whole cluster | whole cluster | whole cluster |
-| Underlying model | ETS + GenServer | gen_server + gossip | cluster-wide lock | delta-CRDT | gen_server + gossip |
+| Scope | one node | cluster | cluster | cluster | cluster |
+| Underlying model | ETS + GenServer | GenServer + gossip | cluster-wide lock | delta-CRDT | GenServer + gossip |
 | Cost per register | µs | µs + async broadcast | ms (cluster-wide lock) | µs + async CRDT delta | µs + async broadcast |
 | Convergence model | n/a | eventual, gossip | synchronous, lock-based | eventual, CRDT merge | eventual, gossip |
-| Net-split behavior | n/a | diverges silently, converges on heal without conflict | collisions on heal resolved by a user-supplied resolver, may kill processes | CRDT merge picks a winner, losing registrations silently dropped | diverges silently, converges on heal without conflict |
+| Net-split behaviour | n/a | diverges, converges on heal without conflict | collisions on heal resolved by user-supplied resolver; may kill processes | CRDT merge picks a winner; losing registrations are dropped | diverges, converges on heal without conflict |
 | Duplicate keys | yes | yes (only mode) | no | no | yes (default) |
 | Unique keys | yes (per-node) | no | yes (cluster-wide) | yes (cluster-wide) | yes (per-node only) |
 | Per-process values | yes | no | no | yes | yes |
@@ -65,16 +65,16 @@ nodes automatically, and the API is shaped like Elixir's `Registry`.
 | Part of OTP | yes | yes | yes | no | no |
 | Interop with other Erlang/OTP apps | no | yes | yes | no | no |
 
-### Which should I use?
+### Choosing a registry
 
-| If you need… | Reach for |
+| Requirement | Recommended |
 |---|---|
-| A group of processes under one key, cluster-wide, with values and a Registry-shaped API | `PgRegistry` |
-| Bare-bones cluster-wide process groups (pids only), or interop with an existing `:pg` user in another OTP app | `:pg` |
-| Exactly one process per name, cluster-wide (a singleton) | `Horde.Registry` |
-| A single-node registry with metadata and match-specs | `Registry` |
-| Cluster-wide name uniqueness with strong semantics, OK with the latency | `:global` |
-| Both cluster-wide singletons and cluster-wide groups in the same app | `Horde.Registry` and `PgRegistry` together |
+| Cluster-wide process groups with values and a `Registry`-shaped API | `PgRegistry` |
+| Cluster-wide process groups (pids only), or interop with existing `:pg` scopes | `:pg` |
+| Exactly one process per name, cluster-wide | `Horde.Registry` |
+| Single-node registry with metadata and match-specs | `Registry` |
+| Cluster-wide name uniqueness with strong consistency | `:global` |
+| Both cluster-wide singletons and cluster-wide groups in the same application | `Horde.Registry` and `PgRegistry` together |
 
 ## API
 
@@ -86,69 +86,54 @@ Three start-link forms are accepted:
 # Bare scope name
 {PgRegistry, :my_registry}
 
-# Scope + opts
+# Scope with options
 {PgRegistry, {:my_registry, listeners: [MyListener]}}
 
-# Registry-shaped keyword form
+# Keyword form (same option names as Registry.start_link/1)
 {PgRegistry, name: :my_registry, listeners: [MyListener], keys: :duplicate}
 ```
 
 Supported options:
 
-- `:listeners` — list of registered process names that receive
+- `:listeners` - a list of locally-registered process names that receive
   `{:register, scope, key, pid, value}` and
-  `{:unregister, scope, key, pid}` messages on join/leave events
-- `:keys` — `:duplicate` (default) or `:unique`. `:unique` enforces
-  per-node uniqueness only; see [Per-node uniqueness](#per-node-uniqueness)
-  below
-- `:partitions` — `1` (default, no-op). Anything greater raises; see
-  [Partitions](#partitions) below
+  `{:unregister, scope, key, pid}` messages on join/leave events.
+- `:keys` - `:duplicate` (default) or `:unique`. In `:unique` mode,
+  uniqueness is enforced per-node only; see
+  [Per-node uniqueness](#per-node-uniqueness) below.
+- `:partitions` - accepted for compatibility with `Registry`. Only the
+  value `1` is supported; other values raise `ArgumentError`. See
+  [Partitions](#partitions) below.
 
 ### Registering processes
 
 ```elixir
-# via the :via tuple (compatible with GenServer/Agent/Task names)
+# Using a :via tuple (compatible with GenServer, Agent, and Task names)
 {:via, PgRegistry, {scope, key}}                # value defaults to nil
 {:via, PgRegistry, {scope, key, value}}         # 3-tuple attaches a value
 
-# via the Registry-shaped API (registers self())
+# Using the self()-based API
 PgRegistry.register(scope, key, value)          #=> {:ok, self()}
 PgRegistry.unregister(scope, key)               #=> :ok
 
-# via the explicit-pid API
+# Using the explicit-pid API
 PgRegistry.register_name({scope, key}, pid)
 PgRegistry.register_name({scope, key, value}, pid)
 PgRegistry.unregister_name({scope, key})
 ```
 
-> #### `:via` and `:duplicate` mode {: .info}
+> #### `:via` tuples in `:duplicate` mode {: .info}
 >
-> The `:via` protocol has two halves, and we treat them separately:
->
->   * **Write side** — `register_name/2` and `unregister_name/1`
->     work in **both** `:duplicate` and `:unique` scopes. "Put this
->     pid under this key" is unambiguous regardless of mode.
->   * **Read side** — `whereis_name/1` and `send/2` (and by
->     extension `GenServer.call`, `GenServer.cast`,
->     `Process.whereis`, and `Kernel.send` on a via tuple) require
->     a **`:unique`**-keyed scope. They raise `ArgumentError` in
->     `:duplicate` mode because the via protocol expects a single
->     pid and a duplicate-keyed scope can legitimately have many.
->
-> Practical consequence: on a `:duplicate`-keyed scope you can
-> use `name: {:via, PgRegistry, ...}` to put a GenServer into a
-> group at start time (the registration succeeds, listeners fire,
-> and the pid is in the group), but you cannot subsequently
-> address it via that name — use `lookup/2`, `lookup_local/2`, or
-> `dispatch/3` to enumerate instead.
->
-> This is the same split `Registry` uses.
+> As with `Registry`, `:via` tuple registration succeeds in
+> `:duplicate` mode, but name resolution (`whereis_name/1`, `send/2`,
+> and by extension `GenServer.call/3`) raises `ArgumentError` because
+> a duplicate-keyed scope may have many pids under one key. Use
+> `lookup/2` or `dispatch/3` to address members instead.
 
-A process may register multiple times under the same key (with
-possibly different values). Each registration is independent and must
-be unregistered separately. When a registered process exits, all of
-its entries are automatically removed and listeners/subscribers are
-notified.
+A process may register multiple times under the same key with different
+values. Each registration is independent and must be unregistered
+separately. When a registered process exits, all of its entries are
+automatically removed and listeners and subscribers are notified.
 
 ### Reading
 
@@ -161,32 +146,31 @@ PgRegistry.which_groups(scope)             # [key, ...]
 PgRegistry.count(scope)                    # total entries
 ```
 
-For a bare-pid view (e.g. `[pid, ...]`), use the Registry-idiomatic
-pattern:
+To extract pids without values:
 
 ```elixir
 for {pid, _} <- PgRegistry.lookup(scope, key), do: pid
 ```
 
-All read functions are lock-free, performed directly against ETS from
-the calling process. They never block on the GenServer.
+All read functions operate directly against ETS from the calling
+process. They do not go through the scope GenServer.
 
-`lookup_local/2` is the one read that has no direct `Registry`
-analog — it's a distributed-registry concern. Useful for draining a
-node before shutdown, per-node metrics, or preferring a local
-instance before falling back.
+`lookup_local/2` has no equivalent in `Registry`. It returns only
+entries whose pid is on the local node, which is useful for draining a
+node before shutdown, collecting per-node metrics, or preferring a
+local process before falling back to a remote one.
 
 ### Updating values
 
 ```elixir
-PgRegistry.update_value(scope, key, new_value)        # self()
-PgRegistry.update_value(scope, key, pid, new_value)   # specific pid
+PgRegistry.update_value(scope, key, new_value)        # updates self()'s entries
+PgRegistry.update_value(scope, key, pid, new_value)   # updates a specific pid's entries
 ```
 
 Updates every entry under `key` whose pid matches. Returns
-`:not_joined` if there's nothing to update. Subscribers (see below)
-receive `{ref, :update, key, [{pid, old, new}]}` events; listeners do
-not — matching `Registry`'s behavior.
+`:not_joined` if the pid has no entry under the key. Subscribers
+receive `{ref, :update, key, [{pid, old, new}]}` events. Listeners
+do not receive update events, matching `Registry`'s behaviour.
 
 ### Match-spec queries
 
@@ -198,21 +182,21 @@ PgRegistry.count_match(scope, key, pattern, guards)
 PgRegistry.unregister_match(scope, key, pattern)
 PgRegistry.unregister_match(scope, key, pattern, guards)
 
-PgRegistry.select(scope, match_spec)        # returns user-defined results
+PgRegistry.select(scope, match_spec)
 PgRegistry.count_select(scope, match_spec)
 ```
 
-`match/3,4` matches against the value position. `select/2` takes a
-full ETS match-spec whose patterns are shaped as `{key, pid, value}`
-(matching `Registry.select/2`). All of these run as native ETS queries
-against the underlying table.
+`match/3,4` matches against the value position. `select/2` accepts a
+full ETS match-spec whose patterns are shaped as `{key, pid, value}`,
+the same shape used by `Registry.select/2`. All of these execute as
+native ETS queries against the underlying table.
 
 ### Subscriptions and listeners
 
-Two ways to react to scope changes:
+There are two mechanisms for reacting to scope changes.
 
-**Listeners** are configured at scope start-up and receive raw
-messages. Same shape as `Registry`'s listeners:
+**Listeners** are configured at scope start-up and receive messages
+matching `Registry`'s listener contract:
 
 ```elixir
 {PgRegistry, name: :my_registry, listeners: [MyListener]}
@@ -222,18 +206,18 @@ messages. Same shape as `Registry`'s listeners:
 {:unregister, :my_registry, key, pid}
 ```
 
-Addressed by registered name (atom), so a listener that crashes and
-restarts under the same name keeps receiving events. Listeners do
-**not** fire on `update_value` (matching `Registry`).
+Listeners are addressed by registered name (atom). A listener that
+crashes and restarts under the same name continues to receive events.
+Listeners do **not** fire on `update_value`, matching `Registry`.
 
-**Runtime subscriptions** are dynamic and use refs. They also fire
-`:update` events:
+**Runtime subscriptions** are dynamic and ref-based. They also
+deliver `:update` events:
 
 ```elixir
 {ref, snapshot} = PgRegistry.Pg.monitor_scope(:my_registry)
 # snapshot :: %{key => [{pid, value}, ...]}
 
-# Subscriber receives:
+# The subscriber receives:
 {^ref, :join,   key, [{pid, value}, ...]}
 {^ref, :leave,  key, [{pid, value}, ...]}
 {^ref, :update, key, [{pid, old, new}, ...]}
@@ -241,9 +225,9 @@ restarts under the same name keeps receiving events. Listeners do
 PgRegistry.Pg.demonitor(:my_registry, ref)
 ```
 
-Use listeners for fixed system-level integrations (logging, metrics,
-side effects on register/unregister). Use subscriptions for
-short-lived consumers that come and go.
+Listeners are suited to fixed system-level integrations such as logging
+or metrics. Subscriptions are suited to consumers that start and stop
+dynamically.
 
 ### Scope-level metadata
 
@@ -253,8 +237,8 @@ PgRegistry.meta(scope, :config)        #=> {:ok, %{retries: 3}}
 PgRegistry.delete_meta(scope, :config)
 ```
 
-Local-only — scope metadata is *not* gossiped between nodes. Stored
-in a sibling ETS table for fast reads.
+Scope metadata is local to the node and is not gossiped. It is stored
+in a sibling ETS table for lock-free reads.
 
 ### Dispatch
 
@@ -264,21 +248,21 @@ PgRegistry.dispatch(scope, key, fn members ->
 end)
 ```
 
-Invokes the callback with the list of pids registered under `key`,
-or no-ops if there are none.
+Invokes the callback with the list of pids registered under `key`.
+If no processes are registered, the callback is not invoked.
 
 ## Design notes
 
 ### Per-node uniqueness
 
 PgRegistry supports `keys: :unique`, but **uniqueness is enforced
-per-node, not cluster-wide**. This is the same scope as `Registry`'s
-`:unique` mode, lifted into a distributed setting:
+per-node, not cluster-wide**. This follows the same scope as
+`Registry`'s `:unique` mode, extended to a distributed setting:
 
-- Within a single node, only one local pid can hold a given key. A
-  second `register/3` returns `{:error, {:already_registered, holder}}`.
-- Across the cluster, **each node can have its own holder** under the
-  same key. There is no cross-node arbitration.
+- On a single node, only one pid can hold a given key. A second
+  `register/3` returns `{:error, {:already_registered, holder}}`.
+- Across the cluster, each node may independently hold the same key.
+  There is no cross-node arbitration.
 
 ```elixir
 {PgRegistry, name: :singletons, keys: :unique}
@@ -286,59 +270,54 @@ per-node, not cluster-wide**. This is the same scope as `Registry`'s
 # On node A:
 {:ok, _} = PgRegistry.register(:singletons, :worker, :v)
 
-# Same node, second call (any pid):
+# Same node, second call:
 {:error, {:already_registered, ^pid_a}} =
   PgRegistry.register(:singletons, :worker, :v)
 
-# Node B at the same time succeeds — its node has its own holder:
+# Node B succeeds independently:
 {:ok, _} = PgRegistry.register(:singletons, :worker, :v)
 ```
 
-The `:via` tuple integrates correctly: `register_name/2` returns `:no`
+The `:via` tuple integrates with this: `register_name/2` returns `:no`
 on collision, so `GenServer.start_link(name: {:via, PgRegistry, ...})`
-surfaces `{:error, {:already_started, pid}}` automatically.
+surfaces `{:error, {:already_started, pid}}`.
 
-When the holding process exits (or calls `unregister/2`), the key
+When the holding process exits or calls `unregister/2`, the key
 becomes available again on that node.
 
-**This is useful when you want a singleton per node** — one
-connection pool per node, one cache per node, one supervisor per
-node — without paying `:global`'s consensus tax. **It is not what
-you want for cluster-wide singletons.** If you need exactly-one
-across the cluster, use `:global` or a leader election library.
+Per-node uniqueness is appropriate for patterns such as one connection
+pool per node or one cache per node. For cluster-wide singletons, use
+`:global` or a leader election library.
 
 Multi-pid joins (`Pg.join(scope, key, [p1, p2])`) raise
-`ArgumentError` in unique mode because they have no meaningful
-semantics — at most one of the pids could ever succeed.
+`ArgumentError` in `:unique` mode because at most one pid can hold a
+unique key.
 
 ### Partitions
 
 PgRegistry uses a single ETS table per scope. `Registry`'s
-`partitions:` option shards the local table to reduce write
-contention; for distributed workloads the dominant cost is
-gossip/convergence, not local writes, so partitioning a node helps
-much less. PgRegistry accepts `partitions: 1` as a no-op and raises
-on anything else.
+`:partitions` option shards the local table to reduce write contention;
+in distributed workloads the dominant cost is gossip and convergence,
+not local writes, so partitioning provides less benefit. PgRegistry
+accepts `partitions: 1` for compatibility and raises on other values.
 
-If you genuinely hit local write contention on a single scope, the
-recommended fix is to split the scope into several scopes (one per
-logical workload), not to partition a single one.
+If local write contention on a single scope becomes a bottleneck,
+splitting the scope into multiple scopes (one per logical workload) is
+the recommended approach.
 
 ### Convergence and net-splits
 
-PgRegistry inherits `:pg`'s eventually-consistent semantics. During
-a netsplit, each side of the partition continues to accept joins
-independently. When the cluster heals, both sides resync via gossip
-and converge without conflict — there's no "winner" to choose
-because duplicates are the normal state.
+PgRegistry inherits `:pg`'s eventually consistent semantics. During a
+network partition, each side continues to accept joins independently.
+When the cluster heals, both sides resync through gossip and converge
+without conflict, since duplicate entries are the expected state.
 
-One known imperfection: on netsplit recovery, sync-driven membership
-changes update ETS correctly but do *not* fire `:update`
-notifications for entries whose metadata changed during the split.
-Subscribers see correct state at every read; only the notification
-stream during convergence is incomplete. See the comment on the
-private `sync_one_group/4` in `lib/pg_registry/pg.ex` for the
-rationale (multi-join ambiguity makes the diff non-unique).
+**Limitation:** on netsplit recovery, sync-driven membership changes
+update ETS correctly but do not fire `:update` notifications for
+entries whose metadata changed during the split. Subscribers observe
+correct state on every read; only the notification stream during
+convergence is incomplete. See the comment on `sync_one_group/4` in
+`lib/pg_registry/pg.ex` for details.
 
 ### Storage layout
 
@@ -348,18 +327,17 @@ Each scope owns an ETS `:duplicate_bag` of rows shaped:
 {key, pid, value, tag}
 ```
 
-where `tag` is an opaque per-node monotonic integer that gives every
-entry its own identity. Tags are internal — callers never see them.
-They exist so that ref-counted multi-join semantics survive a
-flat-row layout, and so that cross-node leaves can identify a
-specific entry unambiguously even when `(key, pid, value)` is
-otherwise duplicated.
+`tag` is an opaque per-node monotonic integer that gives every entry
+its own identity. Tags are not exposed through the public API. They
+allow ref-counted multi-join semantics to survive a flat-row layout and
+enable cross-node leaves to identify a specific entry unambiguously,
+even when `{key, pid, value}` would otherwise collide.
 
-This layout is what makes match-spec queries (`select/2`, `match/3`)
-run natively against ETS — user-supplied match-specs against
-`{key, pid, value}` are translated to operate on the 4-tuple by
+This layout allows match-spec queries (`select/2`, `match/3`) to run
+as native ETS operations. User-supplied match-specs against
+`{key, pid, value}` are translated to the 4-tuple storage shape by
 appending `:_` for the tag.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

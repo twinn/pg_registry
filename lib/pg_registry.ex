@@ -1,28 +1,30 @@
 defmodule PgRegistry do
   @moduledoc """
-  A distributed process registry backed by `PgRegistry.Pg`.
+  A distributed, cluster-aware process registry with per-entry metadata.
 
-  Works like Elixir's `Registry` but discovers processes across clusters
-  and lets you attach a per-process value (metadata) at registration
-  time, just like Registry's `{:via, Registry, {Reg, key, value}}` form.
+  `PgRegistry` provides a `Registry`-shaped API on top of `PgRegistry.Pg`,
+  an Elixir port of Erlang's `:pg` extended with per-entry metadata.
+  Processes registered in a scope are discovered across the cluster through
+  gossip-based eventually consistent membership.
 
-  ## Usage
+  ## Example
 
-      # In your supervision tree
+      # In a supervision tree
       children = [
         {PgRegistry, :my_registry}
       ]
 
-      # Register a GenServer (no value)
-      GenServer.start_link(MyServer, arg, name: {:via, PgRegistry, {:my_registry, :my_key}})
-
-      # Register a GenServer with a value attached
+      # Register a process via a :via tuple
       GenServer.start_link(MyServer, arg,
-        name: {:via, PgRegistry, {:my_registry, :my_key, %{role: :primary}}}
-      )
+        name: {:via, PgRegistry, {:my_registry, :my_key}})
 
-      # Look up entries (returns [{pid, value}])
+      # Register with metadata attached
+      GenServer.start_link(MyServer, arg,
+        name: {:via, PgRegistry, {:my_registry, :my_key, %{role: :primary}}})
+
+      # Look up entries across the cluster
       PgRegistry.lookup(:my_registry, :my_key)
+      #=> [{#PID<0.123.0>, %{role: :primary}}]
   """
 
   alias PgRegistry.Pg
@@ -33,7 +35,7 @@ defmodule PgRegistry do
   @type via_name :: {scope(), key()} | {scope(), key(), value()}
 
   @doc """
-  Starts a `PgRegistry` scope.
+  Starts a `PgRegistry` scope linked to the calling process.
 
   Three forms are accepted:
 
@@ -41,10 +43,10 @@ defmodule PgRegistry do
       PgRegistry.start_link(:my_reg, listeners: [MyL])
       PgRegistry.start_link(name: :my_reg, listeners: [MyL], keys: :duplicate)
 
-  The third (keyword) form mirrors `Registry.start_link/1` for users
-  porting from Registry. `:keys` may be `:duplicate` (a no-op) but
-  `:unique` raises — see the README for the rationale. `:partitions`
-  is accepted and silently ignored.
+  The keyword form accepts the same option names as `Registry.start_link/1`.
+  See `PgRegistry.Pg.start_link/2` for supported options. The `:partitions`
+  option is accepted for compatibility; values other than `1` raise
+  `ArgumentError`.
   """
   @spec start_link(scope() | keyword()) :: GenServer.on_start()
   def start_link(scope) when is_atom(scope), do: Pg.start_link(scope)
@@ -62,8 +64,8 @@ defmodule PgRegistry do
   @doc """
   Returns a child specification for use in a supervision tree.
 
-  Accepts a bare scope atom, a `{scope, opts}` tuple, or a Registry-shaped
-  keyword list with `:name`.
+  Accepts a bare scope atom, a `{scope, opts}` tuple, or a keyword list
+  with a `:name` key.
   """
   @spec child_spec(scope() | {scope(), keyword()} | keyword()) :: Supervisor.child_spec()
   def child_spec({scope, opts}) when is_atom(scope) and is_list(opts) do
@@ -162,78 +164,46 @@ defmodule PgRegistry do
   # ---------------------------------------------------------------------------
   # :via callbacks
   #
-  # The :via name protocol has two halves:
-  #
-  #   * write side — register_name/2, unregister_name/1. "Put this pid
-  #     under this key" / "take it out." Works fine in any mode,
-  #     including :duplicate.
-  #
-  #   * read/resolve side — whereis_name/1 and send/2 (and
-  #     transitively GenServer.call, GenServer.cast, Process.whereis,
-  #     and Kernel.send on a via tuple). "Give me THE pid under this
-  #     key." This is the ambiguous part: a :duplicate-keyed scope can
-  #     legitimately have many pids under one key, and the via
-  #     protocol only has room for one answer. Read-side callbacks
-  #     therefore require a scope started with keys: :unique and
-  #     raise ArgumentError otherwise.
-  #
-  # The practical consequence: you can use `name: {:via, PgRegistry, ...}`
-  # on a GenServer in a :duplicate-keyed scope (the GenServer starts
-  # fine, the registration succeeds, the listener fires), but you
-  # cannot subsequently address that GenServer via that name — you'll
-  # have to enumerate via `lookup/2`, `get_members/2`, or
-  # `dispatch/3`, or use the per-pid handle. For :unique-keyed scopes
-  # the full round-trip (register_name + whereis_name + send) works
-  # as expected.
-  #
-  # Because our :unique is per-node, the read-side callbacks resolve
-  # entirely on the current node — whereis_name/1 returns the local
-  # holder or :undefined, with no remote fallback.
+  # Write side (register_name/2, unregister_name/1) works in both modes.
+  # Read side (whereis_name/1, send/2) requires keys: :unique and
+  # resolves locally only. See @doc on each function for details.
   # ---------------------------------------------------------------------------
 
   @via_resolve_unique """
-  PgRegistry's :via read callbacks (whereis_name/1, send/2, and by
-  extension GenServer.call, GenServer.cast, and Process.whereis on a
-  via tuple) require a scope started with `keys: :unique`. The via
-  protocol expects an unambiguous `name -> pid` mapping, which a
-  `:duplicate`-keyed scope cannot provide.
+  The :via read callbacks (whereis_name/1, send/2, and by extension
+  GenServer.call, GenServer.cast, and Process.whereis on a via tuple)
+  require a scope started with `keys: :unique`. The :via protocol
+  expects an unambiguous name-to-pid mapping, which a `:duplicate`-keyed
+  scope cannot provide.
 
-  For duplicate-keyed scopes, enumerate members explicitly with
-  `lookup/2`, `get_members/2`, `match/3`, or `dispatch/3`, and
-  address pids directly.
+  In `:duplicate` mode, use `lookup/2`, `match/3`, or `dispatch/3` to
+  enumerate members.
   """
 
   @doc """
   Registers `pid` under `{scope, key}` or `{scope, key, value}`.
 
-  Works in both `:duplicate` and `:unique` scopes — this is the write
-  side of the `:via` protocol, and "add this specific pid under this
-  key" is unambiguous regardless of mode.
+  This is the write side of the `:via` protocol and works in both
+  `:duplicate` and `:unique` scopes.
 
-    * In `:duplicate` mode: always returns `:yes`. Multiple pids can
+    * In `:duplicate` mode, always returns `:yes`. Multiple pids may
       be registered under the same key, including the same pid
       multiple times with different values.
 
-    * In `:unique` mode: returns `:yes` on success, or `:no` if
-      another local pid already holds this key.
+    * In `:unique` mode, returns `:yes` on success or `:no` if
+      another local pid already holds the key.
 
-  When called via `GenServer.start_link(name: {:via, PgRegistry, ...})`,
-  a `:no` reply causes `gen.erl` to follow up with `whereis_name/1`
-  and surface `{:error, {:already_started, holder}}` automatically.
+  When invoked through `GenServer.start_link(name: {:via, PgRegistry, ...})`,
+  a `:no` return causes the GenServer to surface
+  `{:error, {:already_started, holder}}`.
 
-  Direct callers (not via `:via`) don't receive the holder pid on the
-  `:no` branch. Use `whereis_name/1` (in unique mode) or `lookup/2`
-  (in either mode) to recover the holder if you need to know who
-  it is.
-
-  > #### Note on `:duplicate` mode and via tuples {: .info}
+  > #### `:via` tuples in `:duplicate` mode {: .info}
   >
-  > You can use `name: {:via, PgRegistry, ...}` on a GenServer in a
-  > `:duplicate`-keyed scope, and the start will succeed. But
-  > subsequent `GenServer.call`, `GenServer.cast`, and `Process.whereis`
-  > on the via tuple will raise, because they call `whereis_name/1`
-  > which requires unique mode. Use `lookup/2` or `lookup_local/2`
-  > to enumerate pids instead.
+  > As with `Registry`, `:via` tuple registration succeeds in
+  > `:duplicate` mode, but name resolution (`whereis_name/1`, `send/2`,
+  > and by extension `GenServer.call/3`) raises `ArgumentError` because
+  > a duplicate-keyed scope may have many pids under one key. Use
+  > `lookup/2` or `dispatch/3` to address members instead.
 
   ## Examples
 
@@ -255,14 +225,14 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Unregisters local processes registered under `{scope, key}`. Works
-  in both `:duplicate` and `:unique` modes.
+  Unregisters local processes registered under `{scope, key}`.
 
-    * In `:duplicate` mode: removes every local pid that has an entry
-      under `key`. Remote pids are unaffected (they're owned by their
-      home node).
+  Works in both `:duplicate` and `:unique` modes.
 
-    * In `:unique` mode: removes the at-most-one local holder.
+    * In `:duplicate` mode, removes every local pid registered under
+      `key`. Remote pids are not affected.
+
+    * In `:unique` mode, removes the single local holder, if any.
 
   Always returns `:ok`.
   """
@@ -282,31 +252,26 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Returns the pid registered under `{scope, key}` on the current
-  node, or `:undefined` if no local pid holds it.
+  Returns the pid registered under `{scope, key}` on the local node,
+  or `:undefined` if no local pid holds the key.
 
-  **Only works for scopes started with `keys: :unique`.** Raises
-  `ArgumentError` for a `:duplicate`-keyed scope, because the via
-  protocol expects a single pid and a duplicate-keyed registry can
-  legitimately have many. For duplicate-keyed scopes, use
-  `lookup/2`, `get_members/2`, or `dispatch/3` instead.
+  Requires a scope started with `keys: :unique`. Raises `ArgumentError`
+  for `:duplicate`-keyed scopes; use `lookup/2` or `dispatch/3` instead.
 
-  ## Resolution is local-only
+  ## Local-only resolution
 
-  Because our `keys: :unique` enforces per-node uniqueness, each
-  node has at most one holder per key. `whereis_name/1` only looks
-  on the current node — there is no remote fallback. If the calling
-  node has no local holder, `:undefined` is returned even if another
-  node in the cluster has one under the same key.
+  Because `keys: :unique` enforces per-node uniqueness, each node has
+  at most one holder per key. This function resolves only on the local
+  node. If the local node has no holder, `:undefined` is returned even
+  if another node in the cluster holds the same key.
 
-  The practical implication: `GenServer.call({:via, PgRegistry, {scope, key}}, msg)`
-  from two different nodes can reach **two different processes** (one
-  per node), and a node with no local holder fails the call. This is
-  the intended shape of the per-node singleton pattern.
+  As a consequence, `GenServer.call({:via, PgRegistry, {scope, key}}, msg)`
+  from two different nodes may reach two different processes (one per
+  node), and a node with no local holder will fail the call.
 
-  Both `{scope, key}` and `{scope, key, value}` via name shapes are
-  accepted; the `value` field is only used at registration time and
-  is ignored by lookup.
+  Both `{scope, key}` and `{scope, key, value}` name shapes are accepted.
+  The `value` element is used only at registration time and is ignored
+  during lookup.
 
   ## Examples
 
@@ -337,12 +302,12 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Sends `msg` to the local process registered under `{scope, key}`.
-  Returns the pid. Raises `ArgumentError` if no local process is
-  registered (see `whereis_name/1` for the "local-only" rule).
+  Sends `msg` to the local process registered under `{scope, key}`
+  and returns the pid.
 
-  **Only works for scopes started with `keys: :unique`.** Raises
-  `ArgumentError` for a `:duplicate`-keyed scope.
+  Raises `ArgumentError` if no local process is registered or if the
+  scope uses `:duplicate` keys. See `whereis_name/1` for details on
+  local-only resolution.
   """
   @spec send(via_name(), term()) :: pid()
   def send(name, msg) do
@@ -368,10 +333,8 @@ defmodule PgRegistry do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns all `{pid, value}` entries registered under `key` in `scope`.
-
-  This is the metadata-aware view. Equivalent to Elixir's `Registry.lookup/2`
-  but spans the cluster.
+  Returns all `{pid, value}` entries registered under `key` in `scope`,
+  across the entire cluster.
 
   ## Examples
 
@@ -390,15 +353,15 @@ defmodule PgRegistry do
 
   @doc """
   Replaces the value attached to every entry under `key` in `scope`
-  whose pid is `pid`. Returns `:not_joined` if `pid` has no entry there.
+  whose pid is `pid`. Returns `:not_joined` if `pid` has no entry.
 
-  > #### Different from `Registry.update_value/3` {: .warning}
+  > #### Difference from `Registry.update_value/3` {: .warning}
   >
-  > If `pid` has been joined to `key` multiple times (because of repeated
+  > If `pid` has been joined to `key` multiple times (through repeated
   > `register/3` or `register_name/2` calls), **all** of its entries are
-  > collapsed to `new_value`. `Registry.update_value/3` doesn't have to
-  > deal with this case because it's only available in `:unique` mode,
-  > where there's at most one entry per pid per key.
+  > set to `new_value`. `Registry.update_value/3` does not encounter this
+  > case because it is only available in `:unique` mode, where at most
+  > one entry exists per pid per key.
   """
   @spec update_value(scope(), key(), pid(), value()) :: :ok | :not_joined
   def update_value(scope, key, pid, new_value) when is_pid(pid) do
@@ -406,8 +369,9 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Sugar for `update_value/4` that updates the calling process's entry.
-  Closer in shape to `Registry.update_value/3` but takes a literal value
+  Calls `update_value/4` with `self()` as the pid.
+
+  Similar to `Registry.update_value/3` but accepts a literal value
   rather than a callback.
 
   ## Examples
@@ -428,8 +392,9 @@ defmodule PgRegistry do
   @doc """
   Returns the list of keys `pid` is registered under in `scope`.
 
-  Walks every group in the scope, so cost is `O(number_of_keys)`. A pid
-  joined to the same key multiple times appears only once in the result.
+  Iterates all groups in the scope; cost is proportional to the number
+  of distinct keys. A pid joined to the same key multiple times appears
+  only once in the result.
 
   ## Examples
 
@@ -449,10 +414,10 @@ defmodule PgRegistry do
 
   @doc """
   Returns the total number of `{pid, value}` entries in `scope`,
-  counting duplicates. Same semantics as Elixir's `Registry.count/1`.
+  including duplicates.
 
-  Implemented as a single `:ets.info/2` call — O(1) regardless of
-  scope size.
+  Reads `:ets.info(scope, :size)` directly, so the cost is constant
+  regardless of scope size.
 
   ## Examples
 
@@ -473,14 +438,14 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Returns only the `{pid, value}` entries under `key` whose pid lives
-  on the current node.
+  Returns only the `{pid, value}` entries under `key` whose pid is
+  on the local node.
 
-  This has no direct analog in Elixir's `Registry` — it's a
-  distributed-registry concern. Use it when you want to operate on
-  just "this node's contribution to the cluster state": draining a
-  node before shutdown, per-node metrics, preferring a local
-  instance, etc. For the cluster-wide view use `lookup/2`.
+  This function has no equivalent in `Registry`. It is useful in
+  distributed contexts such as draining a node before shutdown,
+  collecting per-node metrics, or preferring a local process before
+  falling back to a remote one. For the cluster-wide view, see
+  `lookup/2`.
   """
   @spec lookup_local(scope(), key()) :: [{pid(), value()}]
   defdelegate lookup_local(scope, key), to: Pg
@@ -511,13 +476,12 @@ defmodule PgRegistry do
 
   @doc """
   Invokes `callback` with the list of pids registered under `key` in
-  `scope`, if there are any.
+  `scope`. If no processes are registered under `key`, the callback is
+  not invoked.
 
-  Currently no options are supported. The fourth argument exists for
-  signature parity with `Registry.dispatch/4` but any non-empty option
-  list raises `ArgumentError` rather than silently doing the wrong
-  thing — in particular, `parallel: true` is not implemented; if you
-  need parallelism, spawn tasks from inside the callback yourself.
+  The fourth argument exists for signature compatibility with
+  `Registry.dispatch/4`. No options are currently supported; passing a
+  non-empty list raises `ArgumentError`.
   """
   @spec dispatch(scope(), key(), ([pid()] -> term()), keyword()) :: :ok
   def dispatch(scope, key, callback, opts \\ []) when is_function(callback, 1) and is_list(opts) do
@@ -602,7 +566,6 @@ defmodule PgRegistry do
 
   @doc """
   Returns the values registered by `pid` under `key` in `scope`.
-  Mirrors `Registry.values/3`.
 
   ## Examples
 
@@ -630,7 +593,7 @@ defmodule PgRegistry do
 
   @doc """
   Returns `{pid, value}` entries under `key` in `scope` whose value
-  matches `pattern`. Mirrors `Registry.match/3`.
+  matches `pattern`.
 
   Only a single pattern + guard list is accepted. To run alternative
   patterns over the same key, call `match/3` multiple times or use
@@ -672,10 +635,10 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Runs a Registry-style match-spec across the entire scope.
+  Runs a match-spec across the entire scope.
 
-  The match-spec patterns and bodies are expressed against
-  `{key, pid, value}` tuples, exactly like `Registry.select/2`.
+  Match-spec patterns are expressed against `{key, pid, value}` tuples,
+  the same shape used by `Registry.select/2`.
   """
   @spec select(scope(), :ets.match_spec()) :: [term()]
   def select(scope, match_spec) when is_list(match_spec) do
@@ -683,12 +646,11 @@ defmodule PgRegistry do
   end
 
   @doc """
-  Like `select/2` but returns the count of entries whose match-spec
-  body returns `true`.
+  Like `select/2` but returns the count of matching entries.
 
-  The user's match-spec body is preserved (matching `Registry.count_select/2`),
-  so a body of `[false]` correctly counts zero, and a body that branches
-  on the value can be used as a filter.
+  The match-spec body is preserved, so a body of `[false]` correctly
+  counts zero and a body that branches on the value can be used as a
+  filter.
   """
   @spec count_select(scope(), :ets.match_spec()) :: non_neg_integer()
   def count_select(scope, match_spec) when is_list(match_spec) do
@@ -735,11 +697,11 @@ defmodule PgRegistry do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns `{:ok, value}` if `key` is set in `scope`'s metadata, else
-  `:error`. Local-only — metadata is not gossiped between nodes.
+  Returns `{:ok, value}` if `key` is set in the scope's metadata, or
+  `:error` otherwise.
 
-  Keys must be atoms or tuples, matching `Registry.meta/2`'s
-  `meta_key` contract. Other shapes raise `FunctionClauseError`.
+  Scope metadata is local to the node and is not gossiped between
+  nodes. Keys must be atoms or tuples.
 
   ## Examples
 
