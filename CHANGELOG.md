@@ -1,27 +1,41 @@
 # Changelog
 
-## 0.3.0
-
-This release replaces the `:pg` backend with `PgRegistry.Pg` — a
-self-contained Elixir port of OTP-27 `pg.erl` extended with
-per-entry metadata — and grows the public surface to roughly match
-Elixir's `Registry`.
+## 0.4.0
 
 ### Backwards-incompatible changes
 
-- **Backend swap.** `PgRegistry` no longer uses Erlang `:pg` under
-  the hood. Anyone reaching past the public API into
-  `:pg.get_local_members(scope, key)` (or similar) must switch to
-  `PgRegistry.Pg.get_local_members/2`. The two storage worlds are
-  now disjoint — a scope started by `PgRegistry.start_link/1` lives
-  in `PgRegistry.Pg`'s ETS table, not in `:pg`'s.
+- **`:via` read callbacks require `keys: :unique`.** `whereis_name/1`
+  and `send/2` now raise `ArgumentError` when called on a
+  `:duplicate`-keyed scope. The write-side callbacks (`register_name/2`,
+  `unregister_name/1`) continue to work in both modes. This makes the
+  `:via` contract explicit: registration is always valid, but
+  name-based resolution requires an unambiguous key-to-pid mapping.
+
+### Enhancements
+
+- All cross-node sends now use the `[:noconnect]` option, preventing
+  the scope GenServer from inadvertently triggering node connections.
+
+## 0.3.0
+
+This release replaces the `:pg` backend with `PgRegistry.Pg`, a
+self-contained Elixir port of OTP-27 `pg.erl` extended with per-entry
+metadata, and expands the public API surface to cover most of
+`Registry`'s functionality.
+
+### Backwards-incompatible changes
+
+- **Backend swap.** `PgRegistry` no longer uses Erlang `:pg`
+  internally. Code that reached past the public API into
+  `:pg.get_local_members(scope, key)` or similar must switch to
+  `PgRegistry.Pg.get_local_members/2`. A scope started by
+  `PgRegistry.start_link/1` now lives in `PgRegistry.Pg`'s ETS table,
+  not in `:pg`'s.
 
 - **Wire format.** `PgRegistry.Pg` uses its own wire format and is
   no longer compatible with `:pg`. A protocol-version handshake
-  (`@protocol_version 1`) was added — peers running mismatched
-  versions refuse to peer with a `Logger.warning` rather than
-  silently corrupting state. Bumping the constant on any future
-  wire change is the migration story.
+  (`@protocol_version 1`) was added; peers running mismatched versions
+  refuse to peer and log a warning instead of silently corrupting state.
 
 - **`register_name/2` may now return `:no`.** In a scope started
   with `keys: :unique`, registering under an already-held key
@@ -38,15 +52,15 @@ Elixir's `Registry`.
   attaches a value at registration time.
 - `PgRegistry.lookup/2` — `[{pid, value}]`, the metadata-aware view.
 - `PgRegistry.update_value/3` and `update_value/4` — replace the
-  value of self()'s entry, or any local pid's entry.
+  value of the calling process's entry, or a specific local pid's entry.
 - `Pg.update_meta/4` — lower-level form, broadcasts a `{:update_meta, ...}`
   message so the change reaches every node.
-- Subscription messages grow a third verb `:update` carrying
+- Subscription messages now include an `:update` verb carrying
   `[{pid, old_meta, new_meta}]`.
 
 ### New: Registry-shaped API
 
-- `register/3`, `unregister/2` — self()-shaped wrappers.
+- `register/3`, `unregister/2` — register/unregister the calling process.
 - `lookup/2`, `lookup_local/2`, `values/3`, `keys/2`, `count/1`.
 - `match/3`, `match/4`, `count_match/3`, `count_match/4`.
 - `select/2`, `count_select/2` — user-supplied match-specs against
@@ -55,10 +69,10 @@ Elixir's `Registry`.
 - `unregister_match/3`, `unregister_match/4`.
 - `meta/2`, `put_meta/3`, `delete_meta/2` — local-only registry
   metadata stored in a sibling ETS table named `:"#{scope}_meta"`.
-- `dispatch/4` (with an `_opts` accumulator argument for Registry
-  compat).
-- `monitor_scope/1`, `monitor/2`, `demonitor/2` — runtime
-  subscription with refs.
+- `dispatch/4` (fourth argument for `Registry.dispatch/4` signature
+  compatibility).
+- `monitor_scope/1`, `monitor/2`, `demonitor/2` — ref-based runtime
+  subscriptions.
 
 ### New: listeners
 
@@ -66,36 +80,34 @@ Elixir's `Registry`.
   listener configuration. Listeners receive raw
   `{:register, scope, key, pid, value}` and
   `{:unregister, scope, key, pid}` messages on join/leave events
-  (matching `Registry`'s contract). Local-only; addressed by
-  registered name; missing names are silently dropped rather than
-  crashing the scope.
+  (matching `Registry`'s contract). Listeners are local-only and
+  addressed by registered name. Unregistered names are silently
+  skipped.
 
 ### New: per-node `:unique` mode
 
 - `start_link(name: :reg, keys: :unique)` — each node enforces local
-  uniqueness, but the cluster can still have one holder per node.
-  Use this for "one singleton per node" patterns. For cluster-wide
-  unique names, use `:global`.
+  uniqueness while the cluster may still have one holder per node.
+  For cluster-wide unique names, use `:global`.
 
 ### New: Registry-shaped keyword start_link
 
 - `PgRegistry.start_link(name: :reg, listeners: [...], keys: :duplicate)`
-  for users porting from Registry. `:keys` (`:duplicate` or
-  `:unique`) and `:partitions` (must be `1`) are validated and
-  raise `ArgumentError` with helpful messages on unsupported values.
-  Unknown options also raise. The same validation runs in the
-  2-arity `start_link/2` form.
+  accepts the same option names as `Registry.start_link/1`. `:keys`
+  (`:duplicate` or `:unique`) and `:partitions` (must be `1`) are
+  validated; unsupported values raise `ArgumentError`. Unknown options
+  also raise.
 
 ### Bug fixes
 
 - `unregister_match` deleted the LIFO head of self()'s entries
   rather than the entry that matched the pattern. Fixed by adding
   a gen-server-side primitive that deletes by exact tag.
-- `count_select` over-counted when the user's match-spec body
-  filtered some matches out (we were stripping the body).
+- `count_select` over-counted when the match-spec body filtered some
+  matches out (the body was incorrectly stripped).
 - `count/1` was O(N×M); now uses `:ets.info(scope, :size)`.
-- A missing/crashed listener atom no longer crashes the scope —
-  delivery uses `Process.whereis/1` first.
+- A missing or crashed listener no longer crashes the scope process;
+  delivery checks `Process.whereis/1` first.
 - The local DOWN handler no longer fabricates a `nil`-meta leave
   notification when the ETS row is missing during cleanup.
 - `keys: :unique` registration now skips dead holders, closing the
@@ -105,12 +117,11 @@ Elixir's `Registry`.
 
 ### Known limitations
 
-- `Pg.unregister_match` and friends are by-tag exact deletes, but
-  sync-driven `:update` notifications after a netsplit are still
-  not emitted (state converges correctly, only the notification
-  stream during convergence is incomplete).
-- No `lock/3`. No cluster-wide unique keys. No `partitions: > 1`.
-  Each is a deliberate design decision; see the README.
+- Sync-driven `:update` notifications after a netsplit are not emitted.
+  State converges correctly; only the notification stream during
+  convergence is incomplete.
+- `lock/3`, cluster-wide unique keys, and `partitions: > 1` are not
+  supported. See the README for the rationale.
 
 ## 0.2.2
 

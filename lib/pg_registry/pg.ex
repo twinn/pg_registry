@@ -1,26 +1,23 @@
 defmodule PgRegistry.Pg do
   @moduledoc """
-  An Elixir port of Erlang's `:pg` module, extended with per-member
-  metadata.
+  An Elixir port of Erlang's `:pg` module extended with per-member metadata.
 
-  Distributed named process groups with eventually consistent membership.
-
-  Each scope is its own GenServer registered locally under the scope
-  name, and owns an ETS `:duplicate_bag` of the same name. Each entry
-  is a single row of shape:
+  `PgRegistry.Pg` provides distributed named process groups with
+  eventually consistent membership. Each scope is a GenServer registered
+  locally under the scope name and owns an ETS `:duplicate_bag` of the
+  same name. Each entry is a single row of shape:
 
       {key, pid, meta, tag}
 
-  where `tag` is an opaque per-node monotonic integer that gives every
-  entry its own identity even when `(key, pid, meta)` would otherwise
-  collide. The tag is internal: callers never see it. It exists so
-  that `:pg`'s ref-counted multi-join semantics survive a flat-row
-  layout, and so that cross-node leaves can name a specific entry
-  unambiguously.
+  `tag` is an opaque per-node monotonic integer that gives every entry
+  its own identity even when `{key, pid, meta}` would otherwise collide.
+  Tags are not exposed through the public API. They allow `:pg`'s
+  ref-counted multi-join semantics to survive a flat-row layout and
+  enable cross-node leaves to identify a specific entry unambiguously.
 
   Lookups (`get_members/2`, `lookup/2`, etc.) read the ETS table
-  directly from the caller, so they are still O(rows-for-this-key)
-  and never block. All mutations go through the GenServer.
+  directly from the calling process and never block on the GenServer.
+  All mutations go through the GenServer.
   """
 
   use GenServer
@@ -49,35 +46,32 @@ defmodule PgRegistry.Pg do
   def start_link(scope) when is_atom(scope), do: start_link(scope, [])
 
   @doc """
-  Starts a scope linked to the caller, with options.
+  Starts a scope linked to the calling process.
 
   ## Options
 
-    * `:listeners` — a list of process names that will receive raw
-      `{:register, scope, key, pid, value}` and
-      `{:unregister, scope, key, pid}` messages whenever entries are
-      added or removed. Matches Elixir's `Registry` listener semantics.
+    * `:listeners` - a list of locally-registered process names (atoms)
+      that receive `{:register, scope, key, pid, value}` and
+      `{:unregister, scope, key, pid}` messages when entries are added
+      or removed. This matches `Registry`'s listener contract.
 
-      Each listener must be a **locally-registered name** (atom). The
-      `{name, node()}` tuple form is *not* supported — listeners cannot
-      live on a remote node. Within those constraints, listeners fire
-      on this node for both locally-originated and gossiped-from-peer
-      events. If a listener atom is not currently bound to any process
-      (because the listener crashed, hasn't started yet, or was never
-      configured), the message is silently dropped — we never crash
-      the scope GenServer over a transiently-down listener.
+      The `{name, node()}` tuple form is not supported; listeners must
+      reside on the local node. Listeners fire for both locally-originated
+      and gossiped-from-peer events. If a listener name is not currently
+      registered (because the process has not started or has crashed),
+      the message is dropped without affecting the scope process.
 
-    * `:keys` — `:duplicate` (default) or `:unique`. Unique mode is
-      enforced **per-node only**; the cluster as a whole may still have
-      one holder per node under the same key. See the README's
-      "Per-node uniqueness" section for the rationale and use cases.
+    * `:keys` - `:duplicate` (default) or `:unique`. In `:unique` mode,
+      uniqueness is enforced **per-node only**; each node in the cluster
+      may independently hold the same key. See the "Per-node uniqueness"
+      section in the `PgRegistry` README for details.
   """
   @spec start_link(scope(), keyword()) :: GenServer.on_start()
   def start_link(scope, opts) when is_atom(scope) and is_list(opts) do
     GenServer.start_link(__MODULE__, {scope, opts}, name: scope)
   end
 
-  @doc "Starts a scope outside of any supervision/link tree."
+  @doc "Starts a scope without linking it to the calling process."
   @spec start(scope()) :: GenServer.on_start()
   def start(scope) when is_atom(scope), do: start(scope, [])
 
@@ -106,23 +100,18 @@ defmodule PgRegistry.Pg do
 
   When a list of pids is given, the same `meta` is stored for each.
   A pid may be joined to the same group multiple times with different
-  metas; each entry is independent and must be left separately.
+  metadata values; each entry is independent and must be left separately.
 
-  ## Failure modes
+  ## Unique mode
 
   In a scope started with `keys: :unique`:
 
-    * Single-pid join, key already held by a live local pid →
-      returns `{:error, {:already_registered, pid}}`. The holder pid
-      may briefly be stale across a remote process exit; the
-      registration retries cleanly once the local `:DOWN` is processed.
-    * Multi-pid join (list with more than one element) → **raises**
-      `ArgumentError`. There's no meaningful interpretation of "join
-      these N pids" when at most one of them can ever succeed. The
-      check runs at the API boundary so callers see a clean raise
-      rather than a `gen_server` exit.
+    * If a single pid is given and another live local pid already holds
+      the key, returns `{:error, {:already_registered, pid}}`.
+    * A multi-pid join (list with more than one element) raises
+      `ArgumentError`, since at most one pid can hold a unique key.
 
-  In `:duplicate` mode (the default), this function only returns `:ok`.
+  In `:duplicate` mode (the default), this function always returns `:ok`.
   """
   @spec join(scope(), group(), pid() | [pid()], meta()) ::
           :ok | {:error, {:already_registered, pid()}}
@@ -164,11 +153,10 @@ defmodule PgRegistry.Pg do
   Removes every entry in `group` belonging to local `pid` whose meta
   matches `value_pattern` (with optional `guards`).
 
-  This is the primitive backing `PgRegistry.unregister_match/3,4`. It
-  runs the match-spec atomically inside the scope GenServer and
-  removes entries by their internal tag, so the right entries are
-  deleted regardless of join order. Returns the number of entries
-  removed.
+  This is the primitive backing `PgRegistry.unregister_match/3,4`. The
+  match-spec runs atomically inside the scope GenServer and entries are
+  removed by their internal tag, ensuring correctness regardless of
+  join order. Returns the number of entries removed.
   """
   @spec unregister_match(scope(), group(), pid(), term(), list()) :: non_neg_integer()
   def unregister_match(scope, group, pid, value_pattern, guards \\ []) when is_pid(pid) do
@@ -245,12 +233,11 @@ defmodule PgRegistry.Pg do
       and also as a `:leave` event.
     * Metadata updates in the same window may similarly double-appear.
 
-  Consumers should treat the snapshot as a starting state and absorb
-  events idempotently — fold them into a `MapSet` or `Map` keyed by
-  `(group, pid)` rather than maintaining counters that assume
-  exactly-once delivery. The state always converges to the correct
-  view; only the transient overlap during subscription needs
-  tolerating.
+  Subscribers should treat the snapshot as a starting state and apply
+  events idempotently, for example by maintaining a `Map` keyed by
+  `{group, pid}` rather than a counter that assumes exactly-once
+  delivery. The state converges to the correct view once all pending
+  events have been processed.
   """
   @spec monitor_scope(scope()) :: {reference(), %{group() => [entry()]}}
   def monitor_scope(scope) do
@@ -262,10 +249,9 @@ defmodule PgRegistry.Pg do
   Subscribes to changes in a single `group` and returns a snapshot of
   the current members.
 
-  Same snapshot semantics as `monitor_scope/1` — the snapshot is built
-  in the calling process from a single `:ets.lookup/2`, so the
-  GenServer isn't held for the duration. See `monitor_scope/1` for
-  the race notes.
+  The same snapshot semantics as `monitor_scope/1` apply. The snapshot
+  is built in the calling process from a single `:ets.lookup/2`. See
+  `monitor_scope/1` for details on the overlap window.
   """
   @spec monitor(scope(), group()) :: {reference(), [entry()]}
   def monitor(scope, group) do
@@ -297,13 +283,11 @@ defmodule PgRegistry.Pg do
   # Local-only. Stored in a sibling ETS table named `:"#{scope}_meta"` so
   # reads can bypass the GenServer the same way the entries table can.
   #
-  # Keys are restricted to atoms and tuples, matching Elixir's
-  # `Registry.meta/2,3` family (which has the same guard). This is
-  # tighter than "any term" on purpose: it matches what a Registry
-  # refugee would expect, and it surfaces typos in key names as a
+  # Keys are restricted to atoms and tuples, matching the guards in
+  # Elixir's `Registry.meta/2,3` family. This is intentionally tighter
+  # than "any term": it surfaces typos in key names as a
   # FunctionClauseError at the API boundary rather than a silent
-  # lookup miss. The guard runs in the public API so callers see a
-  # clean raise instead of a gen_server exit.
+  # lookup miss.
   # ---------------------------------------------------------------------------
 
   @typedoc """
@@ -336,13 +320,11 @@ defmodule PgRegistry.Pg do
   defp meta_table(scope), do: :"#{scope}_meta"
 
   @doc """
-  Returns the `:keys` mode (`:unique` or `:duplicate`) a scope was
-  started with. Defaults to `:duplicate` for scopes that don't exist,
-  which matches the default of `start_link/1`.
+  Returns the `:keys` mode (`:unique` or `:duplicate`) for `scope`.
 
-  Reads are backed by `:persistent_term` and don't go through the
-  scope GenServer, so this is safe to call on hot paths (e.g. inside
-  `:via` callbacks).
+  Defaults to `:duplicate` for scopes that have not been started,
+  matching the default of `start_link/1`. The value is read from
+  `:persistent_term` and does not go through the scope GenServer.
   """
   @spec keys_mode(scope()) :: :unique | :duplicate
   def keys_mode(scope) do
