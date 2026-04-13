@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1
+
+### Bug fixes
+
+- Fire `:join`/`:leave` monitor notifications for membership changes
+  arriving via the initial sync exchange or re-sync after reconnection.
+  Previously, entries from a peer that registered before the local scope
+  discovered it were silently added to ETS without notifying monitor
+  subscribers.
+
 ## 0.4.0
 
 ### Backwards-incompatible changes

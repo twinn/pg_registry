@@ -188,6 +188,116 @@ defmodule PgRegistry.PgClusterTest do
     assert :ok = Pg.join(scope, :singleton, self())
   end
 
+  test "monitor receives :join for entries that arrive via initial sync",
+       %{peer_node: peer_node} do
+    # Start a fresh scope locally and subscribe to monitor FIRST.
+    # Then start the scope on the peer with a pre-existing member.
+    # The entry arrives via :sync when the scopes discover each other.
+    sync_scope = :"sync_test_#{:erlang.unique_integer([:positive])}"
+
+    {:ok, _} = Pg.start_link(sync_scope)
+    {ref, _} = Pg.monitor(sync_scope, :pre_existing)
+
+    # Start the scope on the peer and register a member
+    {:ok, _} = :erpc.call(peer_node, Pg, :start, [sync_scope])
+    remote_pid = spawn_remote_member(peer_node, sync_scope, :pre_existing, %{role: :worker})
+
+    sync(sync_scope, peer_node)
+
+    # The join notification should arrive (either via broadcast or sync)
+    assert_receive {^ref, :join, :pre_existing, [{^remote_pid, %{role: :worker}}]}, 2000
+  end
+
+  test "monitor receives :join when a late-joining peer has pre-existing entries",
+       %{scope: scope} do
+    # Subscribe to monitor on the existing scope.
+    {ref, _} = Pg.monitor(scope, :late_group)
+
+    # Spawn a third node with its own scope
+    cookie = Atom.to_charlist(Node.get_cookie())
+
+    {:ok, peer3, peer3_node} =
+      :peer.start(%{
+        name: :"pg_peer3_#{:erlang.unique_integer([:positive])}",
+        args: [~c"-setcookie", cookie]
+      })
+
+    :ok = :erpc.call(peer3_node, :code, :add_paths, [:code.get_path()])
+    {:ok, _} = :erpc.call(peer3_node, Application, :ensure_all_started, [:pg_registry])
+
+    # Start scope on third node and register a member
+    {:ok, _} = :erpc.call(peer3_node, Pg, :start, [scope])
+    remote_pid = spawn_remote_member(peer3_node, scope, :late_group, %{from: :peer3})
+
+    # Wait for sync to propagate
+    sync(scope, peer3_node)
+
+    # Should receive join notification for the third node's entry
+    assert_receive {^ref, :join, :late_group, [{^remote_pid, %{from: :peer3}}]}, 2000
+
+    :peer.stop(peer3)
+  end
+
+  test "sync fires :join for entries added on a new peer that joins with pre-existing members",
+       %{scope: scope} do
+    # This tests sync_one_group: a new peer connects, its initial sync
+    # contains entries for a group we already know about (from other peers).
+    # The new entries should fire :join notifications.
+    {ref, _} = Pg.monitor(scope, :sync_group)
+
+    # Register a local member so the group exists
+    :ok = Pg.join(scope, :sync_group, self(), %{local: true})
+
+    # Spawn a new peer that will join with its own member
+    cookie = Atom.to_charlist(Node.get_cookie())
+
+    {:ok, peer3, peer3_node} =
+      :peer.start(%{
+        name: :"pg_sync_#{:erlang.unique_integer([:positive])}",
+        args: [~c"-setcookie", cookie]
+      })
+
+    :ok = :erpc.call(peer3_node, :code, :add_paths, [:code.get_path()])
+    {:ok, _} = :erpc.call(peer3_node, Application, :ensure_all_started, [:pg_registry])
+    {:ok, _} = :erpc.call(peer3_node, Pg, :start, [scope])
+
+    # Register a member on the new peer
+    remote_pid = spawn_remote_member(peer3_node, scope, :sync_group, %{from: :peer3})
+    sync(scope, peer3_node)
+
+    # Should receive :join for the remote entry
+    assert_receive {^ref, :join, :sync_group, [{^remote_pid, %{from: :peer3}}]}, 2000
+
+    # Both members should be visible
+    members = Pg.lookup(scope, :sync_group)
+    assert length(members) == 2
+    assert {remote_pid, %{from: :peer3}} in members
+
+    :peer.stop(peer3)
+  end
+
+  test "sync_one_group fires :join when a known peer adds a new entry to an existing group",
+       %{scope: scope, peer_node: peer_node} do
+    # Set up: peer has a member in a group, we know about it
+    remote_pid1 = spawn_remote_member(peer_node, scope, :evolving_group, %{v: 1})
+    sync(scope, peer_node)
+
+    {ref, _} = Pg.monitor(scope, :evolving_group)
+
+    # Now the peer adds a SECOND member to the same group.
+    # This goes through the normal {:join, ...} broadcast path
+    # (not sync_one_group), but it proves the notification works
+    # for incremental changes from known peers.
+    remote_pid2 = spawn_remote_member(peer_node, scope, :evolving_group, %{v: 2})
+
+    assert_receive {^ref, :join, :evolving_group, [{^remote_pid2, %{v: 2}}]}, 2000
+
+    members = Pg.lookup(scope, :evolving_group)
+    assert length(members) == 2
+    assert {remote_pid1, %{v: 1}} in members
+    assert {remote_pid2, %{v: 2}} in members
+  end
+
   test "remote update_meta is visible locally and notifies subscribers",
        %{scope: scope, peer_node: peer_node} do
     {ref, _} = Pg.monitor_scope(scope)
