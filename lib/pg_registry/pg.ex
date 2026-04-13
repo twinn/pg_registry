@@ -675,7 +675,7 @@ defmodule PgRegistry.Pg do
 
   @impl true
   def handle_cast({:sync, peer, groups}, %State{} = s) do
-    new_remote = handle_sync(s.scope, peer, s.remote, groups)
+    new_remote = handle_sync(s.scope, peer, s.remote, groups, s.scope_monitors, s.monitored_groups, s.listeners)
     {:noreply, %{s | remote: new_remote}}
   end
 
@@ -962,20 +962,20 @@ defmodule PgRegistry.Pg do
 
   # --- sync from remote peer ---
 
-  defp handle_sync(scope, peer, remote, groups) do
+  defp handle_sync(scope, peer, remote, groups, scope_monitors, monitored_groups, listeners) do
     {mref, remote_groups} =
       case Map.fetch(remote, peer) do
         :error -> {Process.monitor(peer), %{}}
         {:ok, existing} -> existing
       end
 
-    :ok = sync_groups(scope, remote_groups, groups)
+    :ok = sync_groups(scope, remote_groups, groups, scope_monitors, monitored_groups, listeners)
     Map.put(remote, peer, {mref, Map.new(groups)})
   end
 
   # No more groups in the new view → everything left in remote_groups
   # should be removed from ETS.
-  defp sync_groups(scope, remote_groups, []) do
+  defp sync_groups(scope, remote_groups, [], _scope_monitors, _monitored_groups, _listeners) do
     for {group, entries} <- remote_groups, {_pid, _meta, tag} <- entries do
       :ets.match_delete(scope, {group, :_, :_, tag})
     end
@@ -983,18 +983,23 @@ defmodule PgRegistry.Pg do
     :ok
   end
 
-  defp sync_groups(scope, remote_groups, [{group, new_entries} | tail]) do
+  defp sync_groups(scope, remote_groups, [{group, new_entries} | tail], scope_monitors, monitored_groups, listeners) do
     case Map.pop(remote_groups, group) do
       {nil, _} ->
+        # Genuinely new group from this peer — unambiguous join.
         for {pid, meta, tag} <- new_entries do
           :ets.insert(scope, {group, pid, meta, tag})
         end
 
-        sync_groups(scope, remote_groups, tail)
+        pub = strip_tags(new_entries)
+        notify_group(scope_monitors, monitored_groups, :join, group, pub)
+        notify_listeners(listeners, scope, :register, group, pub)
+
+        sync_groups(scope, remote_groups, tail, scope_monitors, monitored_groups, listeners)
 
       {old_entries, new_remote_groups} ->
         :ok = sync_one_group(scope, group, old_entries, new_entries)
-        sync_groups(scope, new_remote_groups, tail)
+        sync_groups(scope, new_remote_groups, tail, scope_monitors, monitored_groups, listeners)
     end
   end
 
