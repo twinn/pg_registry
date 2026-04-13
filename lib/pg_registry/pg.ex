@@ -998,39 +998,40 @@ defmodule PgRegistry.Pg do
         sync_groups(scope, remote_groups, tail, scope_monitors, monitored_groups, listeners)
 
       {old_entries, new_remote_groups} ->
-        :ok = sync_one_group(scope, group, old_entries, new_entries)
+        :ok = sync_one_group(scope, group, old_entries, new_entries, scope_monitors, monitored_groups, listeners)
         sync_groups(scope, new_remote_groups, tail, scope_monitors, monitored_groups, listeners)
     end
   end
 
-  # Compute per-entry diff by (pid, tag). Removed entries are deleted
-  # from ETS; new entries are inserted.
-  #
-  # NOTE: This function deliberately does NOT fire :join/:leave/:update
-  # notifications, even though some entries may have changed. The reason
-  # is that sync only runs on (re)discovery — i.e. on `nodeup` after a
-  # netsplit or when a peer (re)connects — and the diff is ambiguous in
-  # the multi-join case. Two entries with the same pid in `old_entries`
-  # and two with the same pid in `new_entries` (potentially with
-  # different metas) cannot be unambiguously paired up without an
-  # entry-level identifier we don't currently expose on the wire. The
-  # state ends up correct in ETS; only the notification stream during
-  # convergence is incomplete. Subscribers reading the table after sync
-  # always see the right thing.
-  #
-  # If you ever change this to fire notifications, think carefully about
-  # the multi-join ambiguity first — see the README's "Convergence and
-  # net-splits" section.
-  defp sync_one_group(scope, group, old_entries, new_entries) do
+  # Compute per-entry diff by {pid, tag}. The tag is a unique
+  # per-registration identifier, so entries are unambiguously paired.
+  # Fires :join for new entries, :leave for removed entries.
+  defp sync_one_group(scope, group, old_entries, new_entries, scope_monitors, monitored_groups, listeners) do
     new_set = MapSet.new(new_entries, fn {p, _m, t} -> {p, t} end)
     old_set = MapSet.new(old_entries, fn {p, _m, t} -> {p, t} end)
 
-    for {pid, _meta, tag} <- old_entries, not MapSet.member?(new_set, {pid, tag}) do
-      :ets.match_delete(scope, {group, pid, :_, tag})
+    left =
+      for {pid, _meta, tag} = entry <- old_entries, not MapSet.member?(new_set, {pid, tag}) do
+        :ets.match_delete(scope, {group, pid, :_, tag})
+        entry
+      end
+
+    joined =
+      for {pid, meta, tag} = entry <- new_entries, not MapSet.member?(old_set, {pid, tag}) do
+        :ets.insert(scope, {group, pid, meta, tag})
+        entry
+      end
+
+    if left != [] do
+      pub = strip_tags(left)
+      notify_group(scope_monitors, monitored_groups, :leave, group, pub)
+      notify_listeners(listeners, scope, :unregister, group, pub)
     end
 
-    for {pid, meta, tag} <- new_entries, not MapSet.member?(old_set, {pid, tag}) do
-      :ets.insert(scope, {group, pid, meta, tag})
+    if joined != [] do
+      pub = strip_tags(joined)
+      notify_group(scope_monitors, monitored_groups, :join, group, pub)
+      notify_listeners(listeners, scope, :register, group, pub)
     end
 
     :ok
