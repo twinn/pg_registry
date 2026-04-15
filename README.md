@@ -1,5 +1,10 @@
 # PgRegistry
 
+[![CI](https://github.com/twinn/pg_registry/actions/workflows/ci.yml/badge.svg)](https://github.com/twinn/pg_registry/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/pg_registry.svg)](https://hex.pm/packages/pg_registry)
+[![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/pg_registry)
+[![License](https://img.shields.io/hexpm/l/pg_registry.svg)](https://github.com/twinn/pg_registry/blob/main/LICENSE)
+
 A distributed, cluster-aware process registry for Elixir with per-entry
 metadata.
 
